@@ -113,7 +113,12 @@ function relayout() {
   vw = window.innerWidth; vh = window.innerHeight;
   if (vw < 1) vw = 1; if (vh < 1) vh = 1;
   dpr = Math.min(window.devicePixelRatio || 1, 2);
-  if (vw * dpr * vh * dpr > 2400000) dpr = 1.5;
+  // §12.1 fill-rate budget: keep the backing store ≤ 2.4 MP. A fixed 1.5
+  // fallback still exceeds the cap on 12.9" iPads, so compute the clamp
+  // (never above the spec's 1.5 fallback, floor 1).
+  if (vw * dpr * vh * dpr > 2400000) {
+    dpr = Math.max(1, Math.min(1.5, Math.sqrt(2400000 / (vw * vh))));
+  }
   if (dprForced) dpr = dprForced;
   cvs.width = Math.floor(vw * dpr);
   cvs.height = Math.floor(vh * dpr);
@@ -138,13 +143,26 @@ window.addEventListener('resize', function () { scheduleRelayout(false); });
 window.addEventListener('orientationchange', function () { scheduleRelayout(true); });
 if (window.visualViewport) window.visualViewport.addEventListener('resize', function () { scheduleRelayout(false); });
 
+var rotateWasNarrow = false;
 function updateRotateOverlay() {
   var coarse = false;
   try { coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches; } catch (e) {}
-  // Phones only (min dimension < 500): iPad portrait stays playable (testing contract).
-  var show = coarse && vh > vw && Math.min(vw, vh) < 500;
-  rotateOverlay.style.display = show ? 'flex' : 'none';
-  if (show) requestPause();
+  // Narrow portrait coarse-pointer window (min dimension < 500): auto-pause.
+  // iPad full-screen portrait stays playable (testing contract).
+  var narrow = coarse && vh > vw && Math.min(vw, vh) < 500;
+  // Show "ROTATE YOUR DEVICE" only where rotating helps: phone-sized SCREENS.
+  // An iPad Slide Over / Split View window stays narrow after rotating, so it
+  // just pauses without the misleading prompt.
+  var phoneScreen = true;
+  try {
+    if (window.screen && screen.width && screen.height) {
+      phoneScreen = Math.min(screen.width, screen.height) < 500;
+    }
+  } catch (e) {}
+  rotateOverlay.style.display = (narrow && phoneScreen) ? 'flex' : 'none';
+  if (narrow && !rotateWasNarrow) requestPause();
+  else if (!narrow && rotateWasNarrow) { audioRewake(); musicRewake(); }
+  rotateWasNarrow = narrow;
 }
 
 /* §2.4 gesture suppression */
@@ -156,22 +174,36 @@ function updateRotateOverlay() {
 });
 document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
-/* §2.6 lifecycle pause (system-initiated: freeze + suspend audio; stays paused) */
+/* §2.6 lifecycle pause (system-initiated). Unconditional: audio suspends and
+   the music scheduler stops on every scene, not just mid-fight; the fight
+   additionally freezes and stays paused until explicit unpause. */
 function requestPause() {
-  if (G.scene === 'fight' && !G.paused) {
-    G.paused = true; G.pauseIdx = 0;
-    musicStop();
-    if (AC && AC.state === 'running') { try { AC.suspend(); } catch (e) {} }
-  }
+  // stuck-input hygiene: keyup/pointerup may never arrive once we're hidden
+  kbHeld.left = kbHeld.right = kbHeld.up = kbHeld.down = false;
+  dpadReset();
+  // pending edge presses must not survive the background period: a press in
+  // the final tick before hiding would auto-unpause the fight on return
+  // (DESIGN §2.6: explicit unpause required)
+  clearEdges();
+  if (G.scene === 'fight' && !G.paused) { G.paused = true; G.pauseIdx = 0; pauseSnapPrev(); }
+  musicStop();
+  if (AC && AC.state === 'running') { try { AC.suspend(); } catch (e) {} }
+}
+/* restart the appropriate music loop on return (fight music only when the
+   player explicitly resumes; menus/victory restart immediately) */
+function musicRewake() {
+  if (MUS.on || document.hidden || !AC) return;
+  if (G.scene === 'fight') { if (!G.paused) musicStart(true); }
+  else musicStart(false);
 }
 document.addEventListener('visibilitychange', function () {
   if (document.hidden) { requestPause(); }
-  else { audioRewake(); lastNow = performance.now(); }
+  else { audioRewake(); musicRewake(); lastNow = performance.now(); }
 });
 window.addEventListener('blur', function () { requestPause(); });
 window.addEventListener('pagehide', function () { requestPause(); });
-window.addEventListener('pageshow', function () { audioRewake(); lastNow = performance.now(); });
-window.addEventListener('focus', function () { audioRewake(); });
+window.addEventListener('pageshow', function () { audioRewake(); musicRewake(); lastNow = performance.now(); });
+window.addEventListener('focus', function () { audioRewake(); musicRewake(); });
 
 /* ===================== §10 AUDIO (WebAudio synth) ===================== */
 var AC = null, masterGain = null, sfxBus = null, musicBus = null, noiseBuf = null;
@@ -411,6 +443,7 @@ var dpadEl = document.getElementById('dpad');
 var knobEl = document.getElementById('dpad-knob');
 var touchIn = { left: false, right: false, up: false, down: false };
 var dpadPid = null, dpadSector = -1, dpadDead = 14, dpadRadius = 88;
+var dpadCX = 0, dpadCY = 0; // center cached in layoutTouch (§12.5: no DOM reads in the input hot path)
 var uiScale = 1;
 var touchSeen = false;
 
@@ -421,6 +454,8 @@ function layoutTouch() {
   dpadEl.style.width = ds + 'px'; dpadEl.style.height = ds + 'px';
   dpadEl.style.left = Math.round(safe.l + 20) + 'px';
   dpadEl.style.bottom = Math.round(safe.b + 28) + 'px';
+  dpadCX = Math.round(safe.l + 20) + ds / 2;
+  dpadCY = vh - Math.round(safe.b + 28) - ds / 2;
   dpadRadius = ds / 2;
   dpadDead = 14;
   var ks = Math.round(60 * u);
@@ -493,8 +528,7 @@ function dpadReset() {
   knobEl.classList.remove('live');
 }
 function dpadPoint(x, y) {
-  var r = dpadEl.getBoundingClientRect();
-  dpadApply(x - (r.left + r.width / 2), y - (r.top + r.height / 2));
+  dpadApply(x - dpadCX, y - dpadCY);
 }
 function markTouch() {
   touchSeen = true; lastTouchTime = performance.now();
@@ -597,13 +631,15 @@ function neutralize(i) {
   i.left = i.right = i.up = i.down = i.upEdge = false;
   i.lp = i.hp = i.lk = i.hk = i.sp = false;
 }
-function sampleP1() {
+function sampleP1(freezeUpEdge) {
   p1In.left = kbHeld.left || touchIn.left;
   p1In.right = kbHeld.right || touchIn.right;
   p1In.up = kbHeld.up || touchIn.up;
   p1In.down = kbHeld.down || touchIn.down;
   p1In.upEdge = p1In.up && !prevHeldUp;
-  prevHeldUp = p1In.up;
+  // during hitstop the fighter never consumes inputs — keep the up-edge
+  // pending instead of eating it
+  if (!freezeUpEdge) prevHeldUp = p1In.up;
   p1In.lp = EDGE.lp; p1In.hp = EDGE.hp; p1In.lk = EDGE.lk; p1In.hk = EDGE.hk; p1In.sp = EDGE.sp;
 }
 function clearEdges() {
@@ -678,6 +714,7 @@ function spawnP(x, y, vx, vy, life, size, type, col) {
   pVX[i] = vx; pVY[i] = vy; pLife[i] = life; pMaxL[i] = life;
   pSize[i] = size; pType[i] = type; pCol[i] = col;
 }
+function particlesClear() { for (var i = 0; i < PMAX; i++) pType[i] = 0; }
 function particlesTick(speed) {
   for (var i = 0; i < PMAX; i++) {
     if (!pType[i]) continue;
@@ -882,23 +919,34 @@ Fighter.prototype.stepAttack = function (inp, foe, F) {
     this.crouching = this.holdDown;
   }
 };
-Fighter.prototype.update = function (inp, foe, F) {
-  if (this.inputLock) inp = NEUTRAL;
-  this.holdToward = this.facing === 1 ? inp.right : inp.left;
-  this.holdBack = this.facing === 1 ? inp.left : inp.right;
-  this.holdDown = inp.down;
-  // §5 input buffer (6 f)
+/* §5 input buffer (6 f). `frozen` = hitstop: presses are still collected but
+   buffer ages do not advance (the whole fight is frozen), so a press during
+   hitstop fires on the first actionable frame after it — required for the
+   6 f buffer and jab→special cancels to survive 6–16 f of hitstop. */
+Fighter.prototype.bufferInputs = function (inp, frozen) {
+  if (this.inputLock) return;
   if (inp.lp) this.buf.push({ btn: 'lp', down: inp.down, age: 0, sp: null });
   if (inp.hp) this.buf.push({ btn: 'hp', down: inp.down, age: 0, sp: null });
   if (inp.lk) this.buf.push({ btn: 'lk', down: inp.down, age: 0, sp: null });
   if (inp.hk) this.buf.push({ btn: 'hk', down: inp.down, age: 0, sp: null });
   if (inp.sp) {
-    var sid = inp.down ? 'splitter' : (this.holdToward ? 'cyclone' : 'ember');
+    // direction for special selection sampled at the moment of the SP press
+    var toward = this.facing === 1 ? inp.right : inp.left;
+    var sid = inp.down ? 'splitter' : (toward ? 'cyclone' : 'ember');
     this.buf.push({ btn: 'sp', down: inp.down, age: 0, sp: sid });
   }
-  for (var i = this.buf.length - 1; i >= 0; i--) {
-    if (++this.buf[i].age > 6) this.buf.splice(i, 1);
+  if (!frozen) {
+    for (var i = this.buf.length - 1; i >= 0; i--) {
+      if (++this.buf[i].age > 6) this.buf.splice(i, 1);
+    }
   }
+};
+Fighter.prototype.update = function (inp, foe, F) {
+  if (this.inputLock) inp = NEUTRAL;
+  this.holdToward = this.facing === 1 ? inp.right : inp.left;
+  this.holdBack = this.facing === 1 ? inp.left : inp.right;
+  this.holdDown = inp.down;
+  this.bufferInputs(inp, false);
   // post-getup grace ends early on any attack press
   if (this.invulnT > 0 && (inp.lp || inp.hp || inp.lk || inp.hk || inp.sp)) this.invulnT = 0;
   if (this.invulnT > 0) this.invulnT--;
@@ -1048,7 +1096,11 @@ function projTick(F, allowHits) {
 }
 
 /* ===================== §6.1/§6.2 HIT RESOLUTION ===================== */
+/* wall-clamped: §5 pushback reversal only */
 function cornered(f) { return f.x <= 71 || f.x >= 1209; }
+/* §3 corner band: fighter center within 120 lpx of a wall clamp — used by the
+   AI (§11.2 CPU_CORNERED, §11.7 corner-loop guard) */
+function cornerBand(f) { return f.x <= 190 || f.x >= 1090; }
 function applyContact(att, def, m, F, isProj, cx, cy) {
   if (cx === undefined) {
     cx = (att.x + def.x) / 2;
@@ -1078,7 +1130,6 @@ function applyContact(att, def, m, F, isProj, cx, cy) {
     blockSparks(cx, cy);
     S.block();
     att.combo = 0;
-    F.lastBlock = { att: att.idx, f: F.frame, moveId: att.move };
     return;
   }
   // clean hit
@@ -1121,8 +1172,12 @@ function resolveHits(F) {
   var ha = A.getHitbox(), hb = B.getHitbox();
   var hitAB = ha && !B.isInvuln() && rectsOverlap(ha, B.hurtbox());
   var hitBA = hb && !A.isInvuln() && rectsOverlap(hb, A.hurtbox());
-  if (hitAB) applyContact(A, B, MOVES[A.move], F, false);
-  if (hitBA) applyContact(B, A, MOVES[B.move], F, false);
+  // capture both move tables up front: the first applyContact may null the
+  // other fighter's move (hitstun/KD), which must not void a legitimate trade
+  var mA = hitAB ? MOVES[A.move] : null;
+  var mB = hitBA ? MOVES[B.move] : null;
+  if (hitAB) applyContact(A, B, mA, F, false);
+  if (hitBA) applyContact(B, A, mB, F, false);
 }
 function bodyCollision(F) {
   var a = F.p1, b = F.p2;
@@ -1161,7 +1216,7 @@ function newFight(diff, skipIntro) {
     hitstop: 0, shake: 0, slow: 0, slowC: 0, flash: 0,
     projs: [], koPending: [], result: null, lastSec: 99, pipPop: 0,
     comboUI: [{ n: 0, t: 0, pop: 0 }, { n: 0, t: 0, pop: 0 }],
-    lastHit: null, lastBlock: null
+    lastHit: null
   };
   startRound(G.fight, skipIntro);
   G.scene = 'fight'; G.paused = false; G.victor = -1;
@@ -1174,6 +1229,7 @@ function startRound(F, skipIntro) {
   F.timerF = F.finalRound ? 1800 : 5940;
   F.lastSec = Math.ceil(F.timerF / 60);
   F.projs = []; F.koPending = [];
+  particlesClear();
   F.hitstop = 0; F.shake = 0; F.slow = 0; F.slowC = 0; F.flash = 0;
   F.result = null; F.pipPop = 0;
   F.comboUI[0].n = 0; F.comboUI[0].t = 0; F.comboUI[1].n = 0; F.comboUI[1].t = 0;
@@ -1226,7 +1282,9 @@ function timeUp(F) {
   musicStop(); S.card();
 }
 function advanceRoundFlow(F) {
-  if (F.wins[0] >= 2 && F.wins[1] >= 2) {
+  var w0 = F.wins[0], w1 = F.wins[1];
+  if (w0 >= 2 && w1 >= 2 && w0 === w1) {
+    // double-win tie (both at 2 pips, or the tiebreak drew as well)
     if (!F.finalRound) {
       F.finalRound = true; F.round++;
       startRound(F, false);
@@ -1235,8 +1293,9 @@ function advanceRoundFlow(F) {
       G.cards.length = 0;
       musicStart(false);
     }
-  } else if (F.wins[0] >= 2 || F.wins[1] >= 2) {
-    G.victor = F.wins[0] >= 2 ? 0 : 1;
+  } else if (w0 >= 2 || w1 >= 2) {
+    // decisive result — including a decisive tiebreak round (e.g. 3-2)
+    G.victor = w0 > w1 ? 0 : 1;
     G.scene = 'victory'; G.menuIdx = 0;
     G.cards.length = 0;
     musicStart(false);
@@ -1262,13 +1321,21 @@ function endTick(F) {
     projTick(F, false);
     particlesTick(1);
   } else {
+    setPrev(F); // frozen frame (hitstop / slow-mo skip): no interpolation drift
     particlesTick(0.5);
   }
   F.shake *= 0.82;
-  if (F.pt === 70 && F.result && F.result.winner >= 0) {
+  if (F.pt >= 70 && F.result && F.result.winner >= 0) {
+    if (F.pt === 70) S.sting();
     var wf = F.result.winner === 0 ? F.p1 : F.p2;
-    if (wf.state !== 'ko') { wf.setState('win'); wf.move = null; }
-    S.sting();
+    var ws = wf.state;
+    // only strike the victory pose once the winner has finished flying/landing
+    // (Sky Splitter KO, air attacks) or recovering from a trade knockdown
+    if (ws !== 'win' && ws !== 'ko' && !wf.airborne() &&
+        ws !== 'kdAir' && ws !== 'kdGround' && ws !== 'getup' &&
+        ws !== 'hitstun' && ws !== 'blockstun' && ws !== 'land') {
+      wf.setState('win'); wf.move = null;
+    }
   }
   if (F.pt === 110 && F.result) {
     if (F.result.winner < 0) { F.wins[0]++; F.wins[1]++; }
@@ -1298,12 +1365,16 @@ function fightTick() {
   if (F.phase === 'end') { endTick(F); return; }
   // ---- play ----
   advanceCards();
-  sampleP1();
-  if (G.aiOn) F.ai.update(F.p2, F.p1, F, p2In);
-  else neutralize(p2In);
-  // timer runs during hitstop too
+  // hitstop: world (and the AI) is frozen, but the round timer runs and P1's
+  // presses are still buffered so the 6 f input buffer survives the freeze
   if (F.hitstop > 0) {
     F.hitstop--;
+    // freeze hard: snap prev positions so render(alpha) does not oscillate
+    // between the stale start-of-tick prev and the end-of-tick position
+    // (visible ~8 lpx buzz on 120 Hz displays where alpha alternates 0.5/0)
+    setPrev(F);
+    sampleP1(true);
+    F.p1.bufferInputs(p1In, true);
     particlesTick(0.5);
     F.timerF--;
     tickTimerSfx(F);
@@ -1311,6 +1382,9 @@ function fightTick() {
     if (F.timerF <= 0) timeUp(F);
     return;
   }
+  sampleP1(false);
+  if (G.aiOn) F.ai.update(F.p2, F.p1, F, p2In);
+  else neutralize(p2In);
   setPrev(F);
   F.p1.update(p1In, F.p2, F);
   F.p2.update(p2In, F.p1, F);
@@ -1361,7 +1435,14 @@ AI.prototype.roll = function (p) { return this.rng() < p; };
 AI.prototype.newRound = function (rn, lostPrev) {
   this.rng = mulberry32(rn * 7919 + this.d.di * 31);
   this.frame = 0;
-  this.snaps = [];
+  // preallocated 60-slot snapshot ring (§12: no steady-state allocations)
+  if (!this.snapBuf) {
+    this.snapBuf = [];
+    for (var si = 0; si < 60; si++) {
+      this.snapBuf.push({ st: '', mv: null, mf: 0, x: 0, y: 0, contact: false, projN: 0, projX: 0 });
+    }
+  }
+  this.snapHead = 0; this.snapCount = 0;
   this.reacts = [];
   this.refl = null;
   this.intent = null;
@@ -1384,20 +1465,33 @@ AI.prototype.newRound = function (rn, lostPrev) {
   this.pab = null;
   this.aggroRound = lostPrev ? 1.1 : 1.0;
   this.seqHits = 0; this.seqDmg = 0; this.lastHitF = -1;
-  this.lastBlockF = -1;
   this.cornerT = 0;
-  this.okiRolled = false; this.okiGo = false;
+  this.okiGo = false;
   this.prevBlockstun = false;
+  // mash-pressure defense (§11.8 'jab-spam confirms block ceiling'):
+  this.pressN = 0; this.lastAtkF = -999; // observed attack-rhythm cadence
+  this.blockedRow = 0;                   // consecutive blocked hits under pressure
+  this.openHoldT = 0;                    // guaranteed-opening window (§11.7 rule 1)
+  this.counterMv = null;                 // planned blockstun-exit interject
+  this.chainG = false;                   // chain guard engaged (hysteresis)
+  // per-round debug counters (read via __SF.aiDebug(), no gameplay effect)
+  this.dbgPlan = 0; this.dbgFire = 0; this.dbgPress = 0;
 };
-AI.prototype.snapshotOf = function (plr, F) {
+AI.prototype.pushSnap = function (plr, F) {
   var pj = 0, pjx = 0;
   for (var i = 0; i < F.projs.length; i++) {
     if (F.projs[i].o === plr) { pj++; pjx = F.projs[i].x; }
   }
-  return {
-    st: plr.state, mv: plr.move, mf: plr.mf, x: plr.x, y: plr.y,
-    contact: plr.moveHit || plr.moveBlocked, projN: pj, projX: pjx
-  };
+  var s = this.snapBuf[this.snapHead];
+  s.st = plr.state; s.mv = plr.move; s.mf = plr.mf; s.x = plr.x; s.y = plr.y;
+  s.contact = plr.moveHit || plr.moveBlocked; s.projN = pj; s.projX = pjx;
+  this.snapHead = (this.snapHead + 1) % 60;
+  if (this.snapCount < 60) this.snapCount++;
+};
+AI.prototype.snapAt = function (back) { // back = 0 → newest; clamps to oldest
+  if (this.snapCount === 0) return null;
+  if (back >= this.snapCount) back = this.snapCount - 1;
+  return this.snapBuf[(this.snapHead - 1 - back + 120) % 60];
 };
 AI.prototype.pressMove = function (out, id, toward) {
   if (id === 'jab') out.lp = true;
@@ -1425,22 +1519,34 @@ AI.prototype.update = function (cpu, plr, F, out) {
   var toward = plr.x > cpu.x ? 1 : -1;
   var dist = Math.abs(plr.x - cpu.x);
   // ---- perception: ring buffer of snapshots; events read from delayed view ----
-  this.snaps.push(this.snapshotOf(plr, F));
-  if (this.snaps.length > 60) this.snaps.shift();
-  var n = this.snaps.length;
-  var dv = this.snaps[Math.max(0, n - 1 - d.delay)];
-  var pv = this.snaps[Math.max(0, n - 2 - d.delay)];
-  if (pv && dv && n > 2) this.detectEvents(pv, dv, cpu, plr, F);
+  this.pushSnap(plr, F);
+  var dv = this.snapAt(d.delay);
+  var pv = this.snapAt(d.delay + 1);
+  if (pv && dv && pv !== dv && this.snapCount > 2) this.detectEvents(pv, dv, cpu, plr, F);
   // ---- book-keeping / anti-frustration ----
   if (this.passiveT > 0) this.passiveT--;
   if (this.noCloseT > 0) this.noCloseT--;
   if (this.disengageT > 0) this.disengageT--;
-  if (cpu.state === 'attack' || cpu.state === 'hitstun') this.blocksRow = 0;
+  if (cpu.state === 'attack' || cpu.state === 'hitstun' || cpu.state === 'kdAir') {
+    this.blocksRow = 0; this.blockedRow = 0; this.counterMv = null;
+  }
+  // attack-rhythm cadence decays gently once the player stops swinging (the
+  // defense itself stretches the attacker's cadence — pushback, walk-back —
+  // so a hard reset would drop guard exactly when the next hit arrives)
+  if (this.pressN > 0 && this.frame - this.lastAtkF > 40) {
+    this.pressN--; this.lastAtkF = this.frame;
+    if (this.pressN === 0) {
+      this.blockedRow = 0; this.openHoldT = 0; this.chainG = false; this.counterMv = null;
+    }
+  }
   this.trackComboMercy(cpu, plr, F);
-  this.trackPunishAfterBlock(cpu, plr, F);
-  if (cornered(cpu)) this.cornerT++; else this.cornerT = 0;
+  this.trackPunishAfterBlock(cpu, plr, F, dist);
+  if (cornerBand(cpu)) this.cornerT++; else this.cornerT = 0;
   if (cpu.move === 'splitter' && cpu.moveBlocked) this.revShame = true;
   // ---- wake-up (rolled once per knockdown) ----
+  // a fresh knockdown voids any previous (possibly acted) wake record so the
+  // new knockdown gets its own single roll (DESIGN §11.4)
+  if (cpu.state === 'kdAir') this.wake = null;
   if (cpu.state === 'kdGround' || cpu.state === 'getup') {
     if (!this.wake) this.wake = { mode: this.rollWake() };
     this.stepWake(cpu, plr, out, toward);
@@ -1464,6 +1570,22 @@ AI.prototype.update = function (cpu, plr, F, out) {
     this.pab = null;
     return;
   }
+  // ---- mash-pressure counter: decided at blockstun entry (trackPunishAfter-
+  // Block), fired on the first actionable frame — the human answer to
+  // point-blank jab strings is taking your turn back, not re-reacting.
+  // One-shot: if the attacker has already backed out of range on that first
+  // frame the plan is discarded, never held for a later raw reversal ----
+  if (this.counterMv && aiActionable(cpu)) {
+    var cmv = this.counterMv;
+    this.counterMv = null;
+    if (dist <= 150) {
+      if (cmv === 'splitter' && dist > 130) cmv = 'jab'; // reach check at fire time
+      this.refl = null;
+      this.dbgFire++;
+      this.pressMove(out, cmv, toward);
+      return;
+    }
+  }
   // ---- reaction records due -> reflexes (priority: anti-air > block > proj > whiff) ----
   this.fireReactions(cpu, plr, F, dist, toward);
   // ---- active reflex overrides strategy ----
@@ -1471,6 +1593,41 @@ AI.prototype.update = function (cpu, plr, F, out) {
     if (this.stepReflex(cpu, plr, F, out, toward, dist)) return;
     this.refl = null;
   }
+  // ---- chain guard vs sustained close pressure (Medium/Hard): once an
+  // attack rhythm is observed, hold guard between hits instead of re-rolling
+  // a reaction per jab — per-attack rolls structurally lose to 4 f startups
+  // seen through an 11-19 f delay. §11.7 rule 1 still applies: after 4
+  // consecutive blocked hits, guard drops for a guaranteed opening. Easy
+  // keeps its purely reactive (beatable) defense.
+  if (this.dn !== 'easy' && this.pressN >= (this.chainG ? 2 : 3) && dist <= 240 &&
+      (plr.state === 'attack' || plr.state === 'idle' || plr.state === 'walkF' ||
+       plr.state === 'walkB' || plr.state === 'crouch')) {
+    this.chainG = true;
+    if (this.openHoldT > 0) {
+      this.openHoldT--; // guaranteed opening: stand exposed
+      return;
+    }
+    if (this.blockedRow >= 4) {
+      this.openHoldT = 10 + this.irand(6);
+      this.blockedRow = 0;
+      return;
+    }
+    // active defense: take an occasional swing in the observed (delay-aged)
+    // gaps of the rhythm — it trades vs imperfect cadence and keeps the
+    // guard from reading as an infinite turtle
+    if (dist <= 130 && dv && dv.st !== 'attack' && this.passiveT <= 0 &&
+        this.roll(this.dn === 'hard' ? 0.03 : 0.02)) {
+      this.pressMove(out, 'jab', toward);
+      return;
+    }
+    // hold ground in down-back: walking back would break its own counter
+    // range; anti-air/overhead answers come from the reflex layer
+    this.moveDir(out, -toward);
+    out.down = true;
+    this.lastGuardDown = true;
+    return;
+  }
+  this.chainG = false;
   // ---- round opening: first 45 f only walks ----
   if (this.opening > 0) {
     this.opening--;
@@ -1492,23 +1649,38 @@ AI.prototype.update = function (cpu, plr, F, out) {
   }
 };
 
+AI.prototype.pushReact = function (ev) {
+  // handleReaction re-reads live/stale state at fireAt; no payload needed
+  this.reacts.push({ ev: ev, fireAt: this.frame + this.irand(this.d.jit), rolled: false });
+};
 AI.prototype.detectEvents = function (pv, dv, cpu, plr, F) {
-  var d = this.d;
-  var push = (ev, data) => {
-    this.reacts.push({ ev: ev, data: data || null, fireAt: this.frame + this.irand(d.jit), rolled: false });
-  };
-  if (pv.st !== 'attack' && dv.st === 'attack' && dv.mv && !MOVES[dv.mv].air) push('atk', { mv: dv.mv });
+  if (pv.st !== 'attack' && dv.st === 'attack' && dv.mv && !MOVES[dv.mv].air) {
+    this.pushReact('atk');
+    // attack-rhythm cadence: repeated startups accumulate into "mash" reads.
+    // Only startups that could plausibly connect count — out-of-reach whiff
+    // pokes must not sustain the chain guard, or the attacker can hold
+    // Medium/Hard in a permanent down-back turtle and run the clock from
+    // safety. Gate on LIVE spacing, not the delayed view: this is anti-cheese
+    // bookkeeping, not a reaction, and the delayed view overstates distance
+    // against a walking attacker by delay*walkspeed (~50 lpx on Medium),
+    // which filtered out genuine point-blank pressure
+    if (Math.abs(cpu.x - plr.x) <= moveReach(dv.mv) + 40) {
+      this.pressN = Math.min(10, this.pressN + 1);
+      this.lastAtkF = this.frame;
+      this.dbgPress++;
+    }
+  }
   if (pv.st !== 'air' && dv.st === 'air') {
     var vx = dv.x - pv.x;
     var towardCpu = (cpu.x - dv.x) * vx > 0.1;
-    if (Math.abs(vx) < 0.5) push('njump'); else if (towardCpu) push('jumpin');
+    if (Math.abs(vx) < 0.5) this.pushReact('njump'); else if (towardCpu) this.pushReact('jumpin');
   }
-  if (dv.projN > pv.projN) push('proj', { x: dv.projX });
+  if (dv.projN > pv.projN) this.pushReact('proj');
   if (pv.st === 'attack' && dv.st === 'attack' && pv.mv === dv.mv && dv.mv && !dv.contact) {
     var m = MOVES[dv.mv];
-    if (!m.air && pv.mf <= m.startup + m.active && dv.mf > m.startup + m.active) push('whiff', { mv: dv.mv });
+    if (!m.air && pv.mf <= m.startup + m.active && dv.mf > m.startup + m.active) this.pushReact('whiff');
   }
-  if (pv.st !== 'kdAir' && pv.st !== 'kdGround' && (dv.st === 'kdAir' || dv.st === 'kdGround')) push('pkd');
+  if (pv.st !== 'kdAir' && pv.st !== 'kdGround' && (dv.st === 'kdAir' || dv.st === 'kdGround')) this.pushReact('pkd');
 };
 AI.prototype.fireReactions = function (cpu, plr, F, dist, toward) {
   if (!this.reacts.length) return;
@@ -1525,6 +1697,10 @@ AI.prototype.fireReactions = function (cpu, plr, F, dist, toward) {
 };
 AI.prototype.handleReaction = function (r, cpu, plr, F, dist, toward) {
   var d = this.d;
+  // §11.7 rule 2 — PASSIVE combo mercy: reflex BLOCKS are the only reactions
+  // allowed (pkd still runs for its corner-loop bookkeeping, never offense;
+  // proj responses are forced into 'block' mode below)
+  if (this.passiveT > 0 && r.ev !== 'atk' && r.ev !== 'pkd' && r.ev !== 'proj') return false;
   switch (r.ev) {
     case 'jumpin': {
       if (plr.state !== 'air') return false; // stale
@@ -1555,6 +1731,7 @@ AI.prototype.handleReaction = function (r, cpu, plr, F, dist, toward) {
       var m = MOVES[plr.move];
       if (dist > moveReach(plr.move) + 90) return false; // out of range: ignore
       var p = Math.min(d.blockP, 0.80);
+      if (this.openHoldT > 0) return false; // guaranteed opening in progress
       if (this.blocksRow >= 4) { this.blocksRow = 0; return false; } // guaranteed opening
       if (!this.roll(p)) return false; // visible miss, rolled exactly once
       this.blocksRow++;
@@ -1581,6 +1758,7 @@ AI.prototype.handleReaction = function (r, cpu, plr, F, dist, toward) {
         mode2 = this.roll(jp) ? 'jump' : 'block';
       } else mode2 = 'block';
       if (mode2 === 'fire' && (cpu.projLive || plr.hp <= 21)) mode2 = 'block';
+      if (this.passiveT > 0) mode2 = 'block'; // PASSIVE: block is the only reflex
       this.refl = { type: 'projresp', mode: mode2, T: 70, fired: false, projX: px };
       return true;
     }
@@ -1601,11 +1779,11 @@ AI.prototype.handleReaction = function (r, cpu, plr, F, dist, toward) {
     }
     case 'pkd': {
       // okizeme decision (once per knockdown)
-      this.okiRolled = true;
-      var plrCorn = cornered(plr);
+      var plrCorn = cornerBand(plr);
       if (plrCorn) this.cornerKDs++;
       if (this.cornerKDs > 2) { this.disengageT = 90; this.noCloseT = 90; this.okiGo = false; return false; }
-      this.okiGo = this.roll(d.oki) && !(plrCorn); // meaty disabled on cornered player
+      // meaty disabled on cornered player and during PASSIVE mercy
+      this.okiGo = this.roll(d.oki) && !plrCorn && this.passiveT <= 0;
       this.intent = null; // re-pick immediately (OKIZEME becomes available)
       return false;
     }
@@ -1625,7 +1803,7 @@ AI.prototype.stepReflex = function (cpu, plr, F, out, toward, dist) {
       return true;
     case 'aa':
       if (plr.state !== 'air' && !r.fired) return false; // they landed early
-      if (r.mode === 'back') { this.moveDir(out, -toward); if (r.wait <= 0) out.down = true; r.wait--; return r.T > 40 ? true : true; }
+      if (r.mode === 'back') { this.moveDir(out, -toward); if (r.wait <= 0) out.down = true; r.wait--; return true; }
       if (r.mode === 'njump') {
         if (!r.fired) { this.jump(out, 0); r.fired = true; }
         else if (cpu.state === 'air' && cpu.vy > -6) out.lp = true;
@@ -1695,12 +1873,19 @@ AI.prototype.stepWakeFollow = function (cpu, plr, out, toward) {
   if (w.followT > 24) return false;
   switch (w.mode) {
     case 'block': this.moveDir(out, -toward); out.down = this.lastGuardDown = (w.followT % 2 === 0); return true;
-    case 'mash': if (w.followT <= 2) { out.lp = true; return true; } return false;
+    // one-shot options fire exactly once: followT only advances on actionable
+    // frames, so an "<= 2" window would re-fire on the first actionable frame
+    // AFTER the move recovers (double reversal + double budget count)
+    case 'mash':
+      if (!w.acted) { w.acted = true; out.lp = true; return true; }
+      return false;
     case 'reversal':
-      if (w.followT <= 2) { this.pressMove(out, 'splitter', toward); this.reversals++; return true; }
+      if (!w.acted) { w.acted = true; this.pressMove(out, 'splitter', toward); this.reversals++; return true; }
       return false;
     case 'walkback': this.moveDir(out, -toward); return w.followT < 18;
-    case 'njump': if (w.followT <= 2) { this.jump(out, 0); return true; } return false;
+    case 'njump':
+      if (!w.acted) { w.acted = true; this.jump(out, 0); return true; }
+      return false;
   }
   return false;
 };
@@ -1715,19 +1900,47 @@ AI.prototype.trackComboMercy = function (cpu, plr, F) {
       this.passiveT = this.d.passive;
       this.seqHits = 0; this.seqDmg = 0;
       this.intent = null;
+      // §11.7 rule 2: drop any queued offense — only reflex blocks may run
+      this.pab = null;
+      this.counterMv = null;
+      this.okiGo = false;
+      if (this.refl && this.refl.type !== 'block') this.refl = null;
     }
   }
 };
-AI.prototype.trackPunishAfterBlock = function (cpu, plr, F) {
+AI.prototype.trackPunishAfterBlock = function (cpu, plr, F, dist) {
   var inBS = cpu.state === 'blockstun';
-  if (inBS && !this.prevBlockstun && this.d.pab > 0) {
-    // what did we just block? use the player's current move
-    var mv = plr.move;
-    if (mv) {
-      var adv = { jab: -1, straight: 2, snap: 0, axe: 4, lowjab: 0, sweep: 9, splitter: 32, cyclone: 11, airjab: 0, airsmash: 0, ember: 0 }[mv] || 0;
-      if (adv >= 6 && this.roll(this.d.pab)) {
-        var punish = mv === 'splitter' ? 'axe' : (this.roll(0.5) ? 'jab' : 'sweep');
-        this.pab = { punish: punish };
+  if (inBS && !this.prevBlockstun) {
+    this.blockedRow++;
+    if (this.d.pab > 0 && this.passiveT <= 0) {
+      // what did we just block? use the player's current move
+      var mv = plr.move;
+      if (mv) {
+        var adv = { jab: -1, straight: 2, snap: 0, axe: 4, lowjab: 0, sweep: 9, splitter: 32, cyclone: 11, airjab: 0, airsmash: 0, ember: 0 }[mv] || 0;
+        if (adv >= 6 && this.roll(this.d.pab)) {
+          var punish = mv === 'splitter' ? 'axe' : (this.roll(0.5) ? 'jab' : 'sweep');
+          this.pab = { punish: punish };
+        }
+      }
+    }
+    // mash-pressure counter: after blocking hits of an observed close rhythm,
+    // plan an interject on blockstun exit. Gapless jab pressure is +1 on
+    // block, so an equal-speed jab reply loses by exactly one frame — the
+    // real answer is the invulnerable reversal Sky Splitter (invuln f1-7),
+    // with jab replies as honest trade attempts vs imperfect cadence.
+    // Medium/Hard only in practice; Easy stays beatable by mash (§11.8).
+    if (!this.pab && this.passiveT <= 0 && this.blockedRow >= 1 &&
+        this.pressN >= 2 && dist <= 150) {
+      var cp = this.dn === 'hard' ? 0.65 : this.dn === 'medium' ? 0.55 : 0.05;
+      // sustained bot-grade mash (pressN pinned high) escalates counter usage:
+      // flat per-block rolls leave the round outcome to cadence luck, letting
+      // a relentless masher sometimes out-grind Medium via block-ceiling
+      // openings. Human-scale pressure (pressN 2-4) is barely affected.
+      if (this.dn !== 'easy') cp = Math.min(0.9, cp + 0.035 * this.pressN);
+      if (this.roll(cp)) {
+        var spP = this.dn === 'hard' ? 0.75 : this.dn === 'medium' ? 0.70 : 0;
+        this.counterMv = this.roll(spP) ? 'splitter' : 'jab';
+        this.dbgPlan++;
       }
     }
   }
@@ -1880,7 +2093,7 @@ AI.prototype.stepIntent = function (cpu, plr, F, out, toward, dist) {
         if (mv === 'axe' && it.walkUp && !it.mistake) {
           // Hard's signature: time it so predicted distance at now+11 <= reach
           var pvx = 0;
-          if (this.snaps.length > 4) pvx = (this.snaps[this.snaps.length - 1].x - this.snaps[this.snaps.length - 5].x) / 4;
+          if (this.snapCount > 4) pvx = (this.snapAt(0).x - this.snapAt(4).x) / 4;
           var pred = Math.abs((plr.x + pvx * 11) - (cpu.x + 3.2 * toward * 11));
           if (pred <= reach && aiActionable(cpu)) { this.pressMove(out, mv, toward); it.phase = 1; }
           else this.moveDir(out, toward);
@@ -1974,7 +2187,7 @@ AI.prototype.stepIntent = function (cpu, plr, F, out, toward, dist) {
       return;
     }
     case 'ESCAPE': {
-      if (!cornered(cpu) && this.cornerT === 0) { it.done = true; return; }
+      if (!cornerBand(cpu) && this.cornerT === 0) { it.done = true; return; }
       if (!it.mode) {
         var r6 = this.rng();
         var revP = (this.dn === 'hard' ? 0.2 : this.dn === 'medium' ? 0.1 : 0) * (this.reversals < 2 ? 1 : 0);
@@ -1985,7 +2198,7 @@ AI.prototype.stepIntent = function (cpu, plr, F, out, toward, dist) {
         else it.mode = 'block';
       }
       if (it.mode === 'jump') { if (!it.acted && aiActionable(cpu)) { this.jump(out, toward); it.acted = true; } if (cpu.state === 'air') return; if (it.acted) it.done = true; }
-      else if (it.mode === 'cyclone') { if (!it.acted && aiActionable(cpu)) { this.pressMove(out, 'cyclone', toward); it.acted = true; this.reversalsMaybe = 0; } if (it.acted && aiActionable(cpu) && it.t > 10) it.done = true; }
+      else if (it.mode === 'cyclone') { if (!it.acted && aiActionable(cpu)) { this.pressMove(out, 'cyclone', toward); it.acted = true; } if (it.acted && aiActionable(cpu) && it.t > 10) it.done = true; }
       else if (it.mode === 'rev') { if (!it.acted && aiActionable(cpu)) { this.pressMove(out, 'splitter', toward); this.reversals++; it.acted = true; } if (it.acted && aiActionable(cpu) && it.t > 10) it.done = true; }
       else { this.moveDir(out, -toward); if (this.roll(0.5)) { out.down = true; this.lastGuardDown = true; } if (it.t > 35) it.done = true; }
       return;
@@ -2138,9 +2351,9 @@ function fighterPose(f, alpha, out) {
     default: copyPose(STANCE, out);
   }
 }
-/* skeleton draw — flat-shaded vector, outline + fill passes */
-function dU(a) { a *= Math.PI / 180; return [Math.sin(a), -Math.cos(a)]; } // 0 = up
-function dD(a) { a *= Math.PI / 180; return [Math.sin(a), Math.cos(a)]; }  // 0 = down
+/* skeleton draw — flat-shaded vector, outline + fill passes.
+   Joint math is inlined sin/cos (no per-frame array allocations, §12.2). */
+var RAD = Math.PI / 180;
 function limb(ax, ay, bx, by, cxp, cyp, w, col) {
   // outline pass
   ctx.strokeStyle = '#141414'; ctx.lineWidth = w + 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -2159,57 +2372,58 @@ function drawFighterAt(x, y, facing, pal, pose, extraRot, flash) {
   var hipX = p.tx, hipY = -90 + p.ty;
   var rot = (p.rot + (extraRot || 0)) * Math.PI / 180;
   if (rot) { ctx.translate(hipX, hipY); ctx.rotate(rot); ctx.translate(-hipX, -hipY); }
-  var td = dU(p.to);
-  var chX = hipX + td[0] * 58, chY = hipY + td[1] * 58;
-  var hdD = dU(p.to + p.hd);
-  var heX = chX + hdD[0] * 26, heY = chY + hdD[1] * 26;
-  var e, h, k, ft;
+  var ta = p.to * RAD;
+  var tdx = Math.sin(ta), tdy = -Math.cos(ta); // torso dir, 0 = up
+  var chX = hipX + tdx * 58, chY = hipY + tdy * 58;
+  var ha = (p.to + p.hd) * RAD;
+  var heX = chX + Math.sin(ha) * 26, heY = chY - Math.cos(ha) * 26;
+  var a1, a2; // limb segment angles, 0 = down
   // far arm
-  e = dD(p.la1); h = dD(p.la1 + p.la2);
-  var laEX = chX + e[0] * 34, laEY = chY + e[1] * 34;
-  var laHX = laEX + h[0] * 32, laHY = laEY + h[1] * 32;
+  a1 = p.la1 * RAD; a2 = (p.la1 + p.la2) * RAD;
+  var laEX = chX + Math.sin(a1) * 34, laEY = chY + Math.cos(a1) * 34;
+  var laHX = laEX + Math.sin(a2) * 32, laHY = laEY + Math.cos(a2) * 32;
   // far leg
-  k = dD(p.ll1); ft = dD(p.ll1 + p.ll2);
-  var llKX = hipX + k[0] * 46, llKY = hipY + k[1] * 46;
-  var llFX = llKX + ft[0] * 48, llFY = llKY + ft[1] * 48;
+  a1 = p.ll1 * RAD; a2 = (p.ll1 + p.ll2) * RAD;
+  var llKX = hipX + Math.sin(a1) * 46, llKY = hipY + Math.cos(a1) * 46;
+  var llFX = llKX + Math.sin(a2) * 48, llFY = llKY + Math.cos(a2) * 48;
   // near arm
-  e = dD(p.ra1); h = dD(p.ra1 + p.ra2);
-  var raEX = chX + e[0] * 34, raEY = chY + e[1] * 34;
-  var raHX = raEX + h[0] * 32, raHY = raEY + h[1] * 32;
+  a1 = p.ra1 * RAD; a2 = (p.ra1 + p.ra2) * RAD;
+  var raEX = chX + Math.sin(a1) * 34, raEY = chY + Math.cos(a1) * 34;
+  var raHX = raEX + Math.sin(a2) * 32, raHY = raEY + Math.cos(a2) * 32;
   // near leg
-  k = dD(p.rl1); ft = dD(p.rl1 + p.rl2);
-  var rlKX = hipX + k[0] * 46, rlKY = hipY + k[1] * 46;
-  var rlFX = rlKX + ft[0] * 48, rlFY = rlKY + ft[1] * 48;
+  a1 = p.rl1 * RAD; a2 = (p.rl1 + p.rl2) * RAD;
+  var rlKX = hipX + Math.sin(a1) * 46, rlKY = hipY + Math.cos(a1) * 46;
+  var rlFX = rlKX + Math.sin(a2) * 48, rlFY = rlKY + Math.cos(a2) * 48;
   // draw order: far arm, far leg, torso, near leg, head, near arm
   var giDark = flash ? '#ffffff' : shadeCache(pal.gi);
   limb(chX, chY, laEX, laEY, laHX, laHY, 12, giDark);
   circleFill(laHX, laHY, 8, skin, '#141414');
   limb(hipX, hipY, llKX, llKY, llFX, llFY, 15, giDark);
-  foot(llFX, llFY, ft, flash ? '#ffffff' : '#241a20');
+  foot(llFX, llFY, flash ? '#ffffff' : '#241a20');
   // torso quad
-  var perp = [-td[1], td[0]];
+  var perpX = -tdy, perpY = tdx;
   ctx.beginPath();
-  ctx.moveTo(chX + perp[0] * 20, chY + perp[1] * 20);
-  ctx.lineTo(chX - perp[0] * 20, chY - perp[1] * 20);
-  ctx.lineTo(hipX - perp[0] * 15, hipY - perp[1] * 15);
-  ctx.lineTo(hipX + perp[0] * 15, hipY + perp[1] * 15);
+  ctx.moveTo(chX + perpX * 20, chY + perpY * 20);
+  ctx.lineTo(chX - perpX * 20, chY - perpY * 20);
+  ctx.lineTo(hipX - perpX * 15, hipY - perpY * 15);
+  ctx.lineTo(hipX + perpX * 15, hipY + perpY * 15);
   ctx.closePath();
   ctx.fillStyle = gi; ctx.strokeStyle = '#141414'; ctx.lineWidth = 2.5;
   ctx.fill(); ctx.stroke();
   // belt
   ctx.strokeStyle = trim; ctx.lineWidth = 5;
   ctx.beginPath();
-  ctx.moveTo(hipX + perp[0] * 15, hipY + perp[1] * 15);
-  ctx.lineTo(hipX - perp[0] * 15, hipY - perp[1] * 15);
+  ctx.moveTo(hipX + perpX * 15, hipY + perpY * 15);
+  ctx.lineTo(hipX - perpX * 15, hipY - perpY * 15);
   ctx.stroke();
   // rim light on torso
   ctx.strokeStyle = 'rgba(255,220,180,0.5)'; ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(chX + perp[0] * 18 - 2, chY + perp[1] * 18 - 2);
-  ctx.lineTo(hipX + perp[0] * 13 - 2, hipY + perp[1] * 13 - 2);
+  ctx.moveTo(chX + perpX * 18 - 2, chY + perpY * 18 - 2);
+  ctx.lineTo(hipX + perpX * 13 - 2, hipY + perpY * 13 - 2);
   ctx.stroke();
   limb(hipX, hipY, rlKX, rlKY, rlFX, rlFY, 15, gi);
-  foot(rlFX, rlFY, ft, flash ? '#ffffff' : '#241a20');
+  foot(rlFX, rlFY, flash ? '#ffffff' : '#241a20');
   // head
   circleFill(heX, heY, 17, skin, '#141414');
   if (pal.style === 'headband') {
@@ -2252,7 +2466,7 @@ function circleFill(x, y, r, col, outline) {
   ctx.fillStyle = col; ctx.fill();
   if (outline) { ctx.strokeStyle = outline; ctx.lineWidth = 2.5; ctx.stroke(); }
 }
-function foot(x, y, dirV, col) {
+function foot(x, y, col) {
   ctx.strokeStyle = '#141414'; ctx.lineWidth = 13; ctx.lineCap = 'round';
   ctx.beginPath(); ctx.moveTo(x - 4, y); ctx.lineTo(x + 14, y); ctx.stroke();
   ctx.strokeStyle = col; ctx.lineWidth = 8;
@@ -2431,7 +2645,23 @@ function makePreviews() {
 }
 
 /* ===================== §9.4 HUD + MENUS ===================== */
-function fmtTime(F) { return String(Math.max(0, Math.ceil(F.timerF / 60))); }
+/* §12.2 cached HUD strings: font specs, timer seconds and combo labels are
+   memoized so the frame path never rebuilds strings whose value is unchanged */
+var FONTC = {};
+function fontB(px2) {
+  px2 |= 0;
+  return FONTC[px2] || (FONTC[px2] = 'bold ' + px2 + 'px -apple-system, system-ui, sans-serif');
+}
+var SECSTR = [];
+for (var _s = 0; _s <= 99; _s++) SECSTR.push(String(_s));
+var HITSSTR = {};
+function hitsStr(n) {
+  return HITSSTR[n] || (HITSSTR[n] = n + ' HITS!');
+}
+function fmtTime(F) {
+  var s = Math.max(0, Math.ceil(F.timerF / 60));
+  return SECSTR[s] || String(s);
+}
 function drawHUD(alpha, shx, shy) {
   var F = G.fight;
   var nx = shx * 0.25 * scale, ny = shy * 0.25 * scale;
@@ -2447,20 +2677,20 @@ function drawHUD(alpha, shx, shy) {
       // names
       ctx.globalAlpha = 0.85;
       ctx.fillStyle = '#FEFFEA';
-      ctx.font = 'bold ' + Math.max(10, 13 * scale) + 'px -apple-system, system-ui, sans-serif';
+      ctx.font = fontB(Math.max(10, 13 * scale));
       ctx.textAlign = 'left'; ctx.fillText(F.p1.pal.label, L, T + bh + 30 * scale);
       ctx.textAlign = 'right'; ctx.fillText(F.p2.pal.label, R2, T + bh + 30 * scale);
       ctx.globalAlpha = 1;
       // timer
-      var sec = Math.max(0, Math.ceil(F.timerF / 60));
-      var hot = sec <= 10;
+      var secStr = fmtTime(F);
+      var hot = F.timerF <= 600;
       var pulse = hot ? 1 + 0.15 * Math.max(0, 1 - (F.timerF % 60) / 18) : 1;
-      ctx.font = 'bold ' + Math.floor(44 * scale * pulse) + 'px -apple-system, system-ui, sans-serif';
+      ctx.font = fontB(44 * scale * pulse);
       ctx.textAlign = 'center';
       ctx.lineWidth = 3 * scale; ctx.strokeStyle = '#191919';
-      ctx.strokeText(String(sec), vw / 2 + nx, T + 36 * scale);
+      ctx.strokeText(secStr, vw / 2 + nx, T + 36 * scale);
       ctx.fillStyle = hot ? '#ff5040' : '#FEFFEA';
-      ctx.fillText(String(sec), vw / 2 + nx, T + 36 * scale);
+      ctx.fillText(secStr, vw / 2 + nx, T + 36 * scale);
       // combo counters
       drawCombo(F, 0, L, T + bh + 56 * scale);
       drawCombo(F, 1, R2, T + bh + 56 * scale);
@@ -2509,10 +2739,10 @@ function drawCombo(F, idx, x, y) {
   var c = F.comboUI[idx];
   if (c.t <= 0 || c.n < 2) return;
   var sc = 1 + (c.pop > 0 ? (c.pop / 8) * 0.4 : 0);
-  ctx.font = 'bold ' + Math.floor(26 * scale * sc) + 'px -apple-system, system-ui, sans-serif';
+  ctx.font = fontB(26 * scale * sc);
   ctx.textAlign = idx === 0 ? 'left' : 'right';
   ctx.lineWidth = 3; ctx.strokeStyle = '#191919';
-  var s2 = c.n + ' HITS!';
+  var s2 = hitsStr(c.n);
   ctx.strokeText(s2, x, y);
   ctx.fillStyle = '#ffd23e';
   ctx.fillText(s2, x, y);
@@ -2528,7 +2758,7 @@ function drawCard() {
   ctx.globalAlpha = clamp(a, 0, 1);
   ctx.translate(vw / 2, oy + 300 * scale);
   ctx.scale(sc, sc);
-  ctx.font = 'bold ' + Math.floor(72 * scale) + 'px -apple-system, system-ui, sans-serif';
+  ctx.font = fontB(72 * scale);
   ctx.textAlign = 'center';
   ctx.lineWidth = 7 * scale; ctx.strokeStyle = '#FEFFEA';
   ctx.strokeText(c.text, 0, 0);
@@ -2538,7 +2768,7 @@ function drawCard() {
   ctx.fillText(c.text, 0, 0);
   ctx.restore();
 }
-function menuFont(px2) { return 'bold ' + Math.floor(px2 * scale) + 'px -apple-system, system-ui, sans-serif'; }
+function menuFont(px2) { return fontB(px2 * scale); }
 function drawMenuItems(items, sel, cx2, startY, lineH, rectsOut) {
   ctx.textAlign = 'center';
   for (var i = 0; i < items.length; i++) {
@@ -2554,7 +2784,7 @@ function drawMenuItems(items, sel, cx2, startY, lineH, rectsOut) {
 }
 function drawTitle() {
   ctx.textAlign = 'center';
-  ctx.font = 'bold ' + Math.floor(110 * scale) + 'px -apple-system, system-ui, sans-serif';
+  ctx.font = fontB(110 * scale);
   ctx.lineWidth = 10 * scale; ctx.strokeStyle = '#191919';
   ctx.strokeText('KAZAN DUEL', vw / 2, oy + 210 * scale);
   ctx.fillStyle = '#34C52A';
@@ -2600,7 +2830,7 @@ function drawVictory() {
   G.menuRects.length = 0;
   var txt = G.victor === 0 ? 'YOU WIN' : G.victor === 1 ? 'CPU WINS' : 'DRAW GAME';
   ctx.textAlign = 'center';
-  ctx.font = 'bold ' + Math.floor(84 * scale) + 'px -apple-system, system-ui, sans-serif';
+  ctx.font = fontB(84 * scale);
   ctx.lineWidth = 7 * scale; ctx.strokeStyle = '#191919';
   ctx.strokeText(txt, vw / 2, oy + 220 * scale);
   ctx.fillStyle = G.victor === 1 ? '#ff5040' : '#34C52A';
@@ -2709,9 +2939,20 @@ function startSelectedFight() {
   S.uiConfirm();
   newFight(['easy', 'medium', 'hard'][G.selDiff], false);
 }
+function pauseSnapPrev() {
+  // entering pause freezes the sim but render(alpha) keeps lerping every rAF
+  // with alpha oscillating (e.g. ~0/0.5 on 120 Hz): snap prev positions for
+  // fighters, projectiles and particles so nothing buzzes behind the PAUSED
+  // overlay — same defect class as the hitstop / endTick freeze snaps
+  var F = G.fight;
+  if (!F) return;
+  setPrev(F);
+  for (var i = 0; i < PMAX; i++) { pPX[i] = pX[i]; pPY[i] = pY[i]; }
+}
 function togglePause() {
   if (!G.paused) {
     G.paused = true; G.pauseIdx = 0;
+    pauseSnapPrev();
     musicStop(); S.uiConfirm();
     if (AC && musicBus) { try { musicBus.gain.value = 0.03; } catch (e) {} }
   } else resumeFight();
@@ -2719,11 +2960,17 @@ function togglePause() {
 function resumeFight() {
   G.paused = false;
   if (AC) {
-    try { if (AC.state !== 'running') AC.resume(); } catch (e) {}
     try { musicBus.gain.value = 0.28; } catch (e) {}
+    if (AC.state !== 'running') {
+      // resume() is async — play the confirm blip once audio is actually live
+      try {
+        var pr = AC.resume();
+        if (pr && pr.then) pr.then(function () { S.uiConfirm(); }, function () {});
+        else S.uiConfirm();
+      } catch (e) {}
+    } else S.uiConfirm();
   }
   musicStart(true);
-  S.uiConfirm();
 }
 function pauseTick() {
   var tapped = tapHit(G.menuRects);
@@ -2745,6 +2992,7 @@ function pauseAction() {
 }
 function victoryTick() {
   advanceCards();
+  particlesTick(1); // let leftover KO sparks/dust finish instead of freezing
   var tapped = tapHit(G.menuRects);
   if (tapped >= 0) { G.menuIdx = tapped; victoryAction(); return; }
   if (EDGE.up) { G.menuIdx = (G.menuIdx + 2) % 3; S.uiMove(); }
@@ -2783,10 +3031,13 @@ function logicTick() {
 
 /* ===================== §4 GAME LOOP + §12 PERF VALVE ===================== */
 var lastNow = performance.now(), accum = 0;
-var ftAvg = 16.7, slowSince = 0;
-function perfValve(now, dt) {
-  if (dprForced) return;
-  ftAvg += (dt - ftAvg) / 60;
+var ftAvg = 8, slowSince = 0;
+/* §12.7 degradation valve — fed the measured WORK time of logic+render, never
+   the rAF interval: 30 Hz Low Power Mode cadence or a rAF gap (Control Center,
+   tab switch) must not read as "device too slow" and permanently soften dpr. */
+function perfValve(now, workMs) {
+  if (dprForced) return; // never oscillate back
+  ftAvg += (workMs - ftAvg) / 60;
   if (ftAvg > 19) {
     if (!slowSince) slowSince = now;
     else if (now - slowSince > 2000) { dprForced = 1; relayout(); }
@@ -2797,6 +3048,7 @@ function loop(now) {
   var dt = now - lastNow;
   accum += Math.min(dt, 100);
   lastNow = now;
+  var t0 = performance.now();
   var steps = 0;
   while (accum >= STEP && steps < 4) {
     logicTick();
@@ -2805,7 +3057,7 @@ function loop(now) {
   }
   if (steps === 4) accum = 0;
   render(accum / STEP);
-  perfValve(now, dt);
+  perfValve(now, performance.now() - t0);
 }
 
 /* ===================== TESTING CONTRACT: window.__SF ===================== */
@@ -2848,6 +3100,14 @@ window.__SF = {
     newFight(d, true);
   },
   setAI: function (enabled) { G.aiOn = !!enabled; },
+  aiDebug: function () {
+    var F = G.fight;
+    if (!F || !F.ai) return null;
+    var a = F.ai;
+    return { pressN: a.pressN, chainG: !!a.chainG, blockedRow: a.blockedRow,
+             openHoldT: a.openHoldT, counterMv: a.counterMv, plans: a.dbgPlan,
+             fires: a.dbgFire, pressCount: a.dbgPress, passiveT: a.passiveT };
+  },
   setHP: function (player, hp) {
     var F = G.fight;
     if (!F) return;
