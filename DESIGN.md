@@ -1,6 +1,8 @@
 # KAZAN DUEL — Final Design Document
 **Single-file HTML5 1v1 fighting game (player vs CPU). This document is the single source of truth. Where earlier specialist specs disagreed, the value written here is final.**
 
+> **v2 UPGRADE (2026-07):** Part II (§15–§21) extends this document with a 4-fighter roster, a real character-select flow, three stages, a full visual overhaul, and the air-hit reset bug fix. Where Part II explicitly supersedes a Part I value, Part II wins; everything else in Part I (notably §11 CPU AI and the **§11.8 calibration targets, which are frozen**) remains authoritative.
+
 ---
 
 ## 0. Hard Constraints
@@ -104,7 +106,7 @@ On coarse-pointer devices with `vh > vw`: full-screen DOM overlay (`#191919`, ro
 | Logical viewport | 1280 × 720 |
 | Ground line | y = 620 |
 | Playable X | 40 … 1240; fighter center clamped to 70 … 1210 (pushbox half-width 30 respected) |
-| Camera | **Fixed. No scrolling, no parallax.** Both fighters always on screen. |
+| Camera | **Fixed framing** — both fighters always on screen, no scrolling. *(v2: subtle baked-layer parallax driven by the fighters' midpoint x is allowed, see §17.2 — the gameplay camera itself never moves.)* |
 | Screen shake | Camera offset `(rand±M, rand±M*0.6)`, M decays ×0.82/frame. Light hit M=2, heavy M=4, special M=6, KO M=11 (20-frame floor). HUD nudged by 25% of M. |
 | Round start positions | P1 at x = 440, P2 at x = 840, facing each other |
 | Corner | Fighter center within 120 lpx of a wall clamp |
@@ -139,10 +141,10 @@ requestAnimationFrame(loop)
 |---|---|
 | Pushbox | Standing 60w × 170h; crouching 60w × 110h |
 | Hurtbox | Standing 70w × 170h; crouching 70w × 110h; airborne 70w × 120h (bottom at feet). Hurtboxes do **not** extend during attacks. |
-| Walk forward / backward | 3.2 / 2.4 lpx/f |
+| Walk forward / backward | 3.2 / 2.4 lpx/f *(KAZAN baseline — per-character values in §15.2)* |
 | Dashes | **None (cut)** |
 | Prejump | 3 f (no block/attack; direction locked at frame 1) |
-| Jump | vy = −16, gravity +0.9/f² → apex ~142 lpx at ~18 f, airtime ~36 f. Directional jump vx = ±4.0 held for the arc (~142 lpx travel). |
+| Jump | vy = −16, gravity +0.9/f² → apex ~142 lpx at ~18 f, airtime ~36 f. Directional jump vx = ±4.0 held for the arc (~142 lpx travel). *(KAZAN baseline — per-character values in §15.2)* |
 | Landing recovery | 2 f, no actions. Air attack still active on landing is cancelled into the 2 f landing state. |
 | Air rules | One air attack per jump. No air block. No air specials. |
 | Crouch | Hold down; 1 f transition; cannot walk crouched. |
@@ -160,7 +162,7 @@ requestAnimationFrame(loop)
 
 ## 6. Move Set — Authoritative `MOVES` Table
 
-Shared kit for both fighters (they differ only in palette/silhouette flair). "Adv" assumes contact on first active frame. Hitbox format: `(xNear→xFar from fighter center, yBottom→yTop height band above own feet)`; convert at draw/collision time (`groundY − value`, or `feetY − value` airborne).
+**v2 note:** rows 1–8 (normals + air normals) are the **shared normals kit for all four fighters** (small per-character tuning in §15.2: damage scale + standing-reach bonus). Rows 9–11 (Ember Wave / Sky Splitter / Cyclone Boot) are now **KAZAN's character specials**; the other fighters' unique specials are specified in §15.3 and live in the same `MOVES` table format. "Adv" assumes contact on first active frame. Hitbox format: `(xNear→xFar from fighter center, yBottom→yTop height band above own feet)`; convert at draw/collision time (`groundY − value`, or `feetY − value` airborne).
 
 | # | Move | Input | Startup | Active | Recovery | Total | Dmg | Chip | Guard | Hitstun | Blockstun | Adv hit/block | KD | Cancel | Hitbox (x, height band) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -197,6 +199,7 @@ Shared kit for both fighters (they differ only in palette/silhouette flair). "Ad
 - **Knockdown** (Axe Roundhouse, Leg Sweep, Cyclone Boot; Sky Splitter launches with vy = −13, vx = −5 away): KNOCKDOWN_AIR (ballistic, g 0.9) → ground contact → KNOCKDOWN_GROUND 40 f → GETUP 12 f → actionable.
 - **Invulnerability** from first knockdown frame through getup **plus 8 f after actionable** (grace ends early if defender presses any attack). No OTG hits.
 - **Juggles: none.** A launched/downed fighter cannot be re-hit until the invulnerability window expires.
+- **Air-hit reset (v2 — bug fix, normative):** ANY hit that connects with an **airborne** defender puts the defender into KNOCKDOWN_AIR (soft knockdown / air reset) — including non-KD moves like Jab. Ground-only reaction states (HITSTUN, BLOCKSTUN, IDLE, WALK, CROUCH) must never be entered while airborne. Full spec + engine invariant in §19. Deliberate consequence: air hits do NOT chain combo scaling (the defender resets instead of hanging in hitstun).
 - **KO:** HP 0 → loser gets launch physics, winner input locked; slow-mo per §4; then WIN pose.
 
 ---
@@ -291,7 +294,7 @@ Style target: **flat-shaded neo-arcade vector** — bold silhouettes, 2-tone cel
 
 Camera is fixed; the world transform adds only the screen-shake offset.
 
-### 9.2 Stage background ("Harbor Dojo at Dusk", one stage)
+### 9.2 Stage background ("Harbor Dojo at Dusk") — *v2: superseded by §17 (Harbor remains stage 1, rebuilt with layers)*
 
 Baked once per resize into offscreen canvases at `scale*dpr` device resolution (blits are 1:1, no per-frame gradient math):
 
@@ -317,7 +320,7 @@ Angles stored relative to parent (degrees). A pose = 12 angles + `rootDX, rootDY
 
 **Drawing (~30 path ops per fighter):** each limb stroked twice — outline pass (`lineWidth+5`, `#141414`, `lineCap:'round'`) then fill pass (legs 15 w, arms 12 w); torso = filled quad (shoulders 40 → hips 30) with 2.5 px outline; head circle + hair/headband + 2×2 eyes; rim light = thin second stroke (`lineWidth*0.45`, 2 px offset upper-left, lighter tint, 0.5 alpha).
 
-**Two appearances (same skeleton, same moves — palette + accessory only):**
+**Two appearances (same skeleton, same moves — palette + accessory only):** *(v2: superseded — four fighters with distinct builds, silhouettes, and specials per §15; distinct body rendering per §18.1. Table kept for the two legacy palettes.)*
 
 | | **KAZAN** (P1 default) | **VOLT** (CPU default) |
 |---|---|---|
@@ -352,7 +355,7 @@ If both sides pick the same fighter, the CPU auto-swaps to the other.
 State machine: `TITLE → SELECT → FIGHT ⇄ PAUSED → VICTORY → (SELECT | TITLE)`.
 
 - **TITLE:** logo text "KAZAN DUEL", both fighters in idle loop as preview, "TAP TO START / PRESS ANY KEY" (this gesture unlocks audio). Menu music variant (no lead).
-- **SELECT (one screen):** pick fighter (KAZAN / VOLT — palette preview) and difficulty (EASY / MEDIUM / HARD), then FIGHT. Navigation: stick/arrows + confirm (Enter / any attack button / tap).
+- **SELECT:** *(v2: superseded by §16 — three-phase character/rival/battleground select. Still one `G.scene === 'select'` scene for the test contract.)*
 - **FIGHT:** round flow per §7.
 - **PAUSED:** overlay menu — Resume / Restart Fight / Mute (persists to `localStorage['kd_mute']`) / Quit to Title. Freezes sim, timer, audio (music ducked to 0.1 gain).
 - **VICTORY:** "YOU WIN" / "CPU WINS" + winner pose; menu — Rematch / Change Fighter–Difficulty (→SELECT) / Title.
@@ -498,6 +501,8 @@ Ideal spacing (SPACING intent walks to hold): Easy none (drifts to CLOSE); Mediu
 - Hard: an experienced fighting-game player wins ~35–50%; a novice loses but sees readable, punishable patterns.
 - QA: (1) determinism — same seed + same recorded inputs → identical AI; (2) fairness audit — log AI action startup vs input frame, must match `MOVES`; (3) ceiling tests — jump-spam vs Hard lands anti-air rate 0.60–0.75, never 3 in a row; jab-spam confirms block ceiling; (4) corner test — AI disengages per rule 3 within one knockdown cycle; (5) boredom test — 60 s of Hard neutral vs passive player, no intent > 35% of ticks; (6) touch parity — AI identical on iPad (it only reads the shared input struct).
 
+**QA harness note (v2, non-normative — clarifies measurement fidelity; the bullets above are unchanged and still frozen):** `test/probe-ai.mjs`'s frozen ladder/turtle bot (default matchup) is a zero-defense dummy that never blocks at all. Measured against that dummy, "Medium ~50/50" is aspirational, not literal — a competently-tuned Medium is expected to dominate a bot that cannot guard, which is why the ladder guard only asserts the CPU takes ≥ 1 round rather than a literal split. The bullets above describe a "few-hours player," who does occasionally block; the §21/§15.4 per-character band check therefore drives a separate masher with a minimal probabilistic block reaction (see TESTING.md §6) so its "roughly comparable" band — the bot winning at least 2 and at most 10 of 12 sampled rounds, ~17–83% — is measured against a bot closer to that description, one a well-tuned Medium can legitimately land close to even with. That band is a wide anti-domination smoke check, not a precision calibration gate (see TESTING.md §6 for the n=12 statistical rationale); precision steering happens in each character's own §15.4 role map.
+
 AI total ≈ 450–600 lines.
 
 ---
@@ -518,7 +523,9 @@ Frame budget: logic ≤ 2.0 ms, render ≤ 6.0 ms, total ≤ 8 ms.
 
 ## 13. Scope: cuts and size map
 
-**Explicitly cut — do not implement:** throws/grabs and throw techs, super meter, dizzy/stun state, air blocking, air specials, cross-up hits, juggle combos, dashes/runs, extended attack hurtboxes, **scrolling camera and parallax** (fixed camera, single-screen stage), multiple stages, more than 2 fighter appearances, HUD portraits, motion inputs (stretch only), confetti particles, netplay, replays, character creation, camera zoom.
+**Explicitly cut — do not implement:** throws/grabs and throw techs, super meter, dizzy/stun state, air blocking, air specials, cross-up hits, juggle combos, dashes/runs, extended attack hurtboxes, scrolling camera, motion inputs (stretch only), confetti particles, netplay, replays, character creation.
+
+*(v2 un-cuts, per Part II: multiple stages (§17), more than 2 fighter appearances (§15), baked-layer parallax (§17.2), HUD portrait chips (§18.4), and a 2–3-frame hit punch-zoom (§18.3). The v1 line budget in the table below applies to v1 only; the v2 budget is in §20.)*
 
 **Line-budget map:**
 
@@ -558,3 +565,225 @@ Build in this order; each step leaves the file runnable.
 12. **Platform verification:** run iOS Safari checklist end-to-end on a real device — rotate, home-indicator insets, touchcancel, audio interrupt/resume, Low Power Mode 30 Hz, no scroll/zoom/loupe.
 13. **AI QA & calibration:** run §11.8 tests; tune bold-row parameters (aggression, combo conversion, blockP) toward calibration targets.
 14. **Perf pass:** Safari Timeline on oldest available iPad — allocation flatline, frame time ≤ 8 ms; apply the §13 cut list if the file exceeds 3500 lines.
+
+---
+---
+
+# PART II — v2 UPGRADE (Roster · Select · Stages · Visual Overhaul · Air-Hit Fix)
+
+Everything below is normative for the v2 build. Hard constraints carried over unchanged: **one self-contained `index.html`**, zero external assets/libraries/build step, canvas vector art + WebAudio synth only, iOS Safari + desktop, the §12 performance rules, the `window.__SF` test contract (extended per TESTING.md, never broken), the touch-control DOM ids, and the **frozen §11.8 AI calibration targets** (Medium is *supposed* to go ~50/50 vs a jab-masher — never "fix" that).
+
+---
+
+## 15. Roster — Four Fighters
+
+### 15.1 Identity overview
+
+| id | Name | Tagline / style | Color identity | Silhouette read |
+|---|---|---|---|---|
+| `kazan` | **KAZAN** | "The Wanderer" — balanced all-rounder (P1 default) | Crimson gi `#c8322b`, ivory trim `#FEFFEA`, skin `#e8b98a`, accent ember `#ff7a2e` | Medium build, white headband with two swaying tails |
+| `volt` | **VOLT** | "Live Wire" — fast rushdown (CPU default) | Azure sleeveless gi `#2b6fc8`, gold trim `#ffd23e`, skin `#8a5a3a`, accent teal `#34e0c8` | Lean, longer limbs, swept spiked-hair mass (one filled polygon, not triangles) |
+| `tetsu` | **TETSU** | "Iron Bulwark" — heavy bruiser | Deep-green gi `#3f6b3f`, iron trim `#b9c0c8`, skin `#caa27e`, accent amber `#ffb43c` | Massive: wide torso, thick limbs, topknot + full beard |
+| `sable` | **SABLE** | "Dusk Veil" — projectile zoner | Violet gi `#5c3a78`, gold-silver trim `#e8c86a`, skin `#d8a888`, accent moonlight `#b78cff` | Slender, long spring-driven high ponytail, waist sash |
+
+**Alt palettes (mirror matches are now allowed; the later picker gets the alt):** kazan-alt charcoal `#3a3a3a`/crimson trim; volt-alt violet `#6a3ac8`/white trim; tetsu-alt rust `#8c4a2f`/black trim; sable-alt wine `#7a2438`/silver trim. Accent colors stay per character (projectiles must stay readable).
+
+All names and move names are original and non-trademarked.
+
+### 15.2 Per-character stats (authoritative)
+
+Implemented as a `CHARACTERS` registry; `Fighter` reads its stats from `CHARACTERS[charId]` at construction — the old hardcoded constants become KAZAN's row. **Hurtboxes, pushboxes, and wall clamps stay identical for all four** (§5 values) — builds are visual only, so collision balance is untouched.
+
+| Stat | KAZAN | VOLT | TETSU | SABLE |
+|---|---|---|---|---|
+| Max HP | **1000** | 920 | 1150 | 950 |
+| Walk fwd / back (lpx/f) | 3.2 / 2.4 | 3.8 / 2.8 | 2.6 / 2.0 | 3.1 / 2.7 |
+| Jump vy / gravity / air vx | −16 / 0.9 / ±4.0 | −16 / 1.0 / ±4.6 | −14.5 / 0.9 / ±3.4 | −16 / 0.82 / ±4.0 |
+| Damage scale (multiplies `MOVES.dmg`; stacks with Easy's 0.75×) | 1.00 | 0.92 | 1.15 | 0.96 |
+| Standing-normal reach bonus (added to xFar of MOVES rows 1–6) | 0 | 0 | +10 | +6 |
+| Specials | Ember Wave · Cyclone Boot · Sky Splitter | Volt Rush ×2 slots · Thunder Spike | Fault Line ×2 slots · Hammer Lariat | Veil Arrow ×2 slots · Rising Veil |
+
+Rows 1–8 of the §6 `MOVES` table (all normals) are shared verbatim by all four. The reach bonus must be applied in ONE place (`getHitbox`) and the AI's `moveReach` must include it.
+
+### 15.3 Per-character specials
+
+The §8 special-selection rule is unchanged (**sampled at SP press: down → slot D; else toward → slot T; else → slot N**) and works identically on keyboard (O/Space) and the existing touch SP buttons — no new inputs, no new DOM ids. Each character fills the three slots; characters with 2 unique specials map one move to two slots:
+
+| Char | Slot N (neutral/back/up) | Slot T (toward) | Slot D (down) |
+|---|---|---|---|
+| KAZAN | Ember Wave | Cyclone Boot | Sky Splitter |
+| VOLT | Volt Rush | Volt Rush | Thunder Spike |
+| TETSU | Fault Line | Hammer Lariat | Fault Line |
+| SABLE | Veil Arrow | Veil Arrow | Rising Veil |
+
+New move rows (same `MOVES`-table format as §6; hitbox format identical):
+
+| Move | Char | Startup | Active | Recovery | Total | Dmg | Chip | Guard | Hitstun | Blockstun | Adv block | KD | Hitbox / physics |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **Volt Rush** (advancing elbow) | volt | 7 | 10 (moves fwd 6.5 lpx/f) | 15 | 32 | 95 | 22 | Mid | — | 14 | ≈ −10 | **Yes** | x 20→85, y 70→140; single hit (first contact ends hitbox), no invuln |
+| **Thunder Spike** (rising knee) | volt | 4 (**invuln f1–6**) | 7 | rise + 8 land | ≈42 | 110 | 26 | Mid | — | 12 | ≈ −30 | **Yes (launch)** | x 5→60, y 55→180 attached while rising; vy = −13, g 0.9, fwd drift 1.5 |
+| **Fault Line** (ground shockwave) | tetsu | 16 | flight | 20 after spawn | 36 commit | 90 | 24 | **Low** | 20 | 14 | varies | No | proj 50×26 hugging ground (center height 20), speed 3.5 lpx/f, **despawns after 300 lpx of travel**; must be crouch-blocked |
+| **Hammer Lariat** (advancing lariat) | tetsu | 14 (**armor f4–9**, see below) | 8 (moves fwd 4.0 lpx/f) | 18 | 40 | 140 | 30 | Mid | — | 15 | ≈ −14 | **Yes** | x 25→105, y 80→160; single hit |
+| **Veil Arrow** (fast bolt) | sable | 10 | flight | 14 after spawn | 24 commit | 70 | 10 | Mid | 16 | 12 | varies | No | proj 40×14, spawns x+70 center height 105, speed 8.5 lpx/f |
+| **Rising Veil** (anti-air bolt) | sable | 11 | flight | 22 after spawn | 33 commit | 85 | 12 | Mid | — | 13 | varies | **Yes (air reset)** | proj 34×34, spawns x+40 center height 80, velocity (+4.5, −4.5), despawns above y=40 or after 40 f |
+
+**New mechanic — one-hit armor (Hammer Lariat only):** a move may declare `armor:[a,b]` (move-frames, inclusive). If the fighter is hit while inside the window and armor not yet used this move: take **full damage** (all scalings apply; lethal damage still KOs normally), but **no hitstun/blockstun/pushback/knockdown** — the move keeps running; set `armorUsed`; 4-frame gray body flash + metallic clank SFX (triangle 1800 Hz, 40 ms). Absorbs exactly one hit per move use, including projectiles and KD moves. Armor is not block: no chip logic involved.
+
+**Projectile rules generalized:** still max ONE live projectile per fighter (Sable cannot have Veil Arrow and Rising Veil live at once). `spawnProj` takes a per-move packet {w, h, spawnDX, centerH, vx, vy, guard, dmg, chip, hitstun, kd, rangeMax, style}; projectile clash (§6) applies between any two projectiles. Fault Line ignores gravity and never leaves the ground band. A Rising Veil that hits an airborne opponent triggers the §19 air reset (its natural anti-air role).
+
+**New SFX (recipes in the §10 style, wired in `startMove`/projectile spawn):** Volt Rush = Cyclone recipe pitched +40% + zap (square 1200→300 Hz, 60 ms, 0.18); Thunder Spike = Sky Splitter +20% pitch + crackle noise burst; Fault Line = 70 Hz sine thump 200 ms + lowpass rumble noise; Hammer Lariat = heavy-whiff + armor clank on absorb; Veil Arrow = Ember recipe shortened to 140 ms, brighter (saw 320→160); Rising Veil = reverse sweep saw 100→500 Hz 180 ms.
+
+**New animations (same keyframe system, durations read from MOVES):** `voltRush` (coiled elbow lunge, 3 keys), `thunderSpike` (crouched coil → rising knee, 3 keys), `faultLine` (overhead double-fist ground slam, 3 keys), `lariat` (wind-up twist → extended-arm spin → settle, 3 keys), `veilArrow` (quick one-hand fling, 2 keys), `risingVeil` (upward two-hand cast, 3 keys). ANIMS become per-character where movesets diverge (namespaced keys or per-char anim sets built in `buildAnims`).
+
+### 15.4 CPU AI generalization — role maps (protects §11.8)
+
+The AI's logic stays exactly §11; only its **hardcoded move ids** become lookups into `CHARACTERS[id].ai`:
+
+| Field | KAZAN | VOLT | TETSU | SABLE |
+|---|---|---|---|---|
+| `dp` (invuln reversal: anti-air, wake-up reversal, mash counter, corner escape) | `splitter` | `thunderspike` | `null` | `null` |
+| `fireball` (ZONING intent + counter-fire) | `ember` | `null` | `faultline` (min interval ×1.3) | `veilarrow` |
+| `advance` (approach special / corner escape) | `cyclone` | `voltrush` | `lariat` | `null` |
+| `antiAir` mode | `dp` | `dp` | `passive` (walk-back block / neutral-jump Air Jab only) | `proj` (Rising Veil timed 24–36 f before landing) |
+| Zoning utility multiplier | 0.15 | 0.2 | 0.15 | 0.16 |
+| Aggression multiplier | 0.65 | 1.30 | 0.18 | 0.4 |
+| Ideal spacing Medium / Hard (lpx) | 300 / 350 | 220 / 240 | 260 / 280 | 400 / 430 |
+| Combo plans (Hard) | jab→jab→ember-cancel; jab→splitter-cancel | jab→jab→voltrush-cancel | jab→straight; sweep | jab→veilarrow-cancel |
+
+Null-role fallbacks (required): `dp:null` → wake-up reversal weight redistributed to block-on-rise, mash-counter interject uses fastest normal (Jab), corner escape uses `advance` or forward jump; `fireball:null` → ZONING intent unavailable (weight to APPROACH/POKE); `advance:null` → approach uses walk/jump only. The duplicated per-move block-advantage table inside `trackPunishAfterBlock` is **deleted and computed from `MOVES` at boot** (assert the computed values match the legacy literals for the v1 kit). `AI.pressMove` maps roles → the §8 slot inputs generically. `moveReach` takes the fighter (reach bonus). Seeded per-round RNG stays.
+
+**Calibration protection (hard requirement):** `AI_TUNE` (§11.6) and §11.8 targets are untouched. `node test/probe-ai.mjs` must still pass on the default matchup (P1 KAZAN vs CPU VOLT): mash bot beats Easy, loses to Medium and Hard, no turtle-lock. If Volt's new kit drifts the Medium-vs-masher result out of band, tune **Volt's role-map numbers or Volt's special frame data only** — never §11.6/§11.8. Other characters must be "roughly comparable": Medium as each CPU character vs the mash bot must win at least 2 and at most 10 of 12 sampled rounds (~17–83% bot-winrate, a wide anti-domination smoke band rather than a precision gate — verified by the extended probe, §21).
+
+---
+
+## 16. Character Select Flow (v2)
+
+One scene — `G.scene === 'select'` throughout (test contract) — with three phases in `G.sel = {phase, cursor, p1, p2, stage, diff}`. Difficulty and last picks persist across visits within a session. `__SF.start()` continues to bypass select entirely.
+
+**Phase 0 — "CHOOSE YOUR FIGHTER".** Four character cards in a centered row (~200×260 lpx each): dark plate, live idle-animated fighter (via `drawFighterAt` at ~0.8 scale — reuse the preview-fighter pattern), name plate, style tag (ALL-ROUNDER / RUSHDOWN / BRUISER / ZONER). Left panel: large preview of the cursor character + 5-pip stat bars (SPD / PWR / HP) + its special-move names. Cursor = glowing pedestal + brightened card border (replaces the old floor ellipse). Input: ←/→ move cursor, Enter/any-attack confirm, Esc → title. Touch: tap a card — if cursor already there, confirm; else move cursor (two-tap confirm). All tap targets registered through the existing `drawMenuItems`/`G.menuRects`/`tapHit` mechanism (rects emitted during render).
+
+**Phase 1 — "CHOOSE YOUR RIVAL".** Same four cards plus a fifth "?? RANDOM" card (cursor defaults to RANDOM). Same input rules; Esc → phase 0. Mirror pick allowed (rival gets the alt palette).
+
+**Phase 2 — "BATTLEGROUND".** Top: VS banner (both picked fighters in idle, facing each other; RANDOM shows a silhouette). Three menu rows: **STAGE** ◀ HARBOR DUSK / NIGHT MARKET / TEMPLE DAWN / RANDOM ▶ (each with a small stylized emblem chip — sun disc / neon bars / torii glyph; no mini-bakes), **DIFFICULTY** ◀ EASY / MEDIUM / HARD ▶, **FIGHT!**. ↑/↓ row, ←/→ cycle, Enter on FIGHT! starts (Enter on other rows advances to next row). Esc → phase 1. Touch: tap ◀/▶ zones and FIGHT!.
+
+**Start:** `startSelectedFight` resolves RANDOMs (plain `Math.random`, not the AI's seeded RNG), sets `G.charP1`, `G.charP2`, `G.stageId`, calls `newFight(diff)`. `newFight`'s hardcoded "P2 = the other of 2" is replaced by "P2 = G.charP2" (mirror → alt palette). **Victory menu item 0 stays REMATCH → `newFight` directly with the same characters/stage** (test 05 depends on one Enter press = instant rematch); item 1 → select (phase 0, picks retained); item 2 → title.
+
+Defaults everywhere (title quick-start paths, `__SF.start` with no opts): p1 `kazan`, p2 `volt`, stage `harbor`, difficulty as passed/`medium`.
+
+---
+
+## 17. Stages (v2 — three stages)
+
+### 17.1 Registry & invariants
+
+`STAGES = { harbor, market, temple }`, each `{ name, light: {dir, rimColor}, bake(layers), live(ctx, t) }`, plus `G.stageId`. Rebake path unchanged: any stage switch or relayout sets `stageDirty` and the existing rebake hook rebuilds. **Invariants for every stage:** ground line y=620; floor strip blitted at y=608 (1280×130); shadows at y=622; letterbox clear `#0a0a0a` (test 09 samples it); world clip rect; §12 bake-everything rule (no gradients/shadowBlur/filters in the frame path); live overlay ≤ 20 draw ops.
+
+### 17.2 Layer model + parallax
+
+Each stage bakes FOUR offscreen layers at `scale*dpr`: **L0 sky** (1280×720, static), **L1 far** (transparent, baked **1320 wide** = 20 px overscan each side), **L2 mid** (transparent, 1320 wide), **floor** (1280×130, static). Per frame: `shift = clamp((midX − 640)/640, −1, 1)` where midX = fighters' midpoint x; blit L0 at 0, L1 at `−20 + shift*6`, L2 at `−20 + shift*14`, floor at (0, 608). Cost: 4 blits + live overlay. The gameplay camera and all gameplay coordinates are unaffected — parallax is a background-blit offset only.
+
+### 17.3 The three stages
+
+**`harbor` — HARBOR DUSK** (rework of the v1 stage; default). L0: dusk gradient `#2b1a4d → #b4432e → #f7a03c`, 90 px sun `#ffd98a` at (860, 190) + 3 halos, 12 stars. L1: city skyline `#1d1430` + harbor crane, warm haze band (baked `#f7a03c` @ 0.12 over the silhouette base). L2: pagoda left; **pier railing** (posts every ~90 px with rope swags) filling the old empty band behind the fighters; crate stacks at x<200 and x>1080; two moored-boat masts; **two lantern poles (x≈140 and x≈1140) with a catenary cable sagging to y≈150 — the 5 lanterns HANG FROM THE CABLE** (fixes the floating-lantern read). Floor: wooden deck as v1 + brighter plank highlights. Live: lantern bobs (cable-attached) + one swaying pennant. Light: warm from upper-right, rim `#ffcf8a`.
+
+**`market` — NIGHT MARKET.** L0: night gradient `#070b1e → #101a38`, thin moon sliver, faint city glow. L1: rooftop silhouettes with water tanks, scattered lit windows (2×3 px warm dots). L2: market stalls with striped awnings (`#b8323c`/`#e8e0c8`), two catenary strings of warm bulb dots, **abstract neon sign shapes** (glyph-like rectangles/strokes, teal `#34e0c8` + magenta `#ff4fa0`, baked with pre-drawn glow discs), crates, a bicycle silhouette. Floor: wet flagstone `#23283a` with joint seams and **baked vertical reflection smears** (teal/magenta @ 0.15) under the neon. Live: 2 neon signs flicker (alpha = sin, distinct phases), 2 drifting steam wisps (pre-baked blob sprites translated slowly, wrap around). Light: cool from upper-left, rim `#7ae8ff`.
+
+**`temple` — TEMPLE DAWN.** L0: sunrise gradient `#f7d9b0 → #eda27c → #c96a5a`, low pale sun left. L1: three mountain silhouette bands (`#7a5878`, `#5a3d5c`, `#43304a`) separated by baked haze bands @ 0.2. L2: large torii gate (`#8c2f2a`, shading `#5c1f1c`) center-right, pair of stone lanterns, maple tree left with foliage mass `#c85a4a`, baked waist-height mist band @ 0.10. Floor: stone slabs `#55504a`, joint lines, moss flecks, darkened front edge. Live: 4 drifting petals `#e88a7a` (use the particle pool with a `petal` type — sinusoidal fall, respawn at top; pool entries have px/py so interpolation/pause snapping is inherited) + slow mist alpha drift. Light: warm from left, rim `#ffd9c0`.
+
+### 17.4 Stage choice
+
+Chosen on the select screen (phase 2) with a RANDOM option; REMATCH keeps the same stage. `__SF.start` defaults to `harbor` unless `opts.stage` is passed. Every stage must survive test 09 (mid-fight resizes → rebake, zero console errors, dark letterbox).
+
+---
+
+## 18. Visual Overhaul (v2) — normative art spec
+
+Adopts the graphics-audit priorities. §12 perf rules still bind: budget ≤ 350 ops/frame, zero steady-state allocation, nothing gradient/blur/filter in the frame path, perf valve intact. Particle pool grows **160 → 256** slots (same parallel-array design).
+
+### 18.1 Fighter bodies — from stick figures to cel-shaded characters
+
+Keep the 13-joint skeleton, the 13-value pose interface, all pose/anim data, and the px/py interpolation contract **unchanged**. Replace the stroke-per-limb skinning inside `drawFighterAt` with polygon pieces computed from the same joint positions:
+
+- **Limbs = tapered capsules:** each bone segment is a filled quad with perpendicular half-widths at each end (thigh 11→7, shin 9→5.5, upper arm 8→6, forearm 7→5 — all × per-char width multiplier), end caps as arcs. Two-piece limbs meet with a filled joint disc (knee/elbow).
+- **Torso + gi:** torso polygon from shoulderL/shoulderR/hipR/hipL with slight chest bulge (quadratic curves); gi jacket V-collar (two overlapping trim-color quads), sleeve cuffs (VOLT sleeveless: skin-colored upper arms + trim shoulder band), **gi skirt = 2 quads hanging from the hips**, belt band + **2 hanging belt tails**. Skirt/belt-tails/headband/ponytail sway via a tiny per-fighter **velocity-driven spring stepped in logic ticks** — never `performance.now()` (must freeze correctly under pause and hitstop).
+- **Cel shading:** split each piece longitudinally along the bone axis; the half facing away from the stage light (`STAGES[id].light.dir`) is filled with `shadeCache(color, 0.72)`. Plus a 2 px rim-light stroke (stage `rimColor`, 0.5 alpha) on the light-facing edge of torso, head, and the two leading limbs only (≤ 6 rim strokes/fighter).
+- **Outline:** every piece stroked `#141414`, lineWidth 4, round joins — bold silhouette preserved.
+- **Head:** skull circle + jaw wedge, ear dot, brow line, 2×3 eyes, 2 px mouth. Per-char hair as filled polygons: KAZAN headband + tails; VOLT swept 5-spike mass; TETSU bald + topknot + beard mass; SABLE 3-segment spring-chain ponytail.
+- **Hands/feet:** hands = knuckle-wedge polygon (~13×11, rotated to forearm angle) during punch anims, circle otherwise; feet = heel+toe polygon 24×9.
+- **Per-char build table** (visual only; hurtboxes unchanged): `{limbLen, limbW, torsoW, headR}` = kazan 1.0/1.0/1.0/1.0; volt 1.04/0.88/0.95/1.0; tetsu 0.98/1.25/1.22/1.05; sable 1.02/0.85/0.90/0.97.
+- White hit-flash (flashT) and gray armor-flash override all colors; debug hitbox overlay retained. **Budget ≤ 80 path ops per fighter** (was ~30) — measure and stay inside the frame budget; the perf valve must not trip on an iPad-class device.
+
+### 18.2 Animation polish
+
+Data-only edits in `buildAnims`: anticipation key (slight opposite wind-up) before Straight Blast, Axe Roundhouse, Sweep, and all new heavies; overshoot/settle key on their recoveries; idle breathe (torso ty ±1.5 over the 64 f loop) + subtle head bob; landing squash key (2 f); walk keys adjusted so feet visibly plant (kill foot-skate). New-move anims per §15.3.
+
+### 18.3 Impact FX & juice
+
+- **Hit starburst:** 8-spike polygon at contact point, radius 10→22 (light) / 14→34 (heavy/special), 7 f life, outQuad shrink, attacker-accent color, drawn inside the existing single `'lighter'` block.
+- **Directional hit wedge** on heavies/specials: elongated triangle ~60×14 along the attack vector, 6 f.
+- **Shake up:** light 3.5, heavy 7, special 10, KO 16 (same 0.82 decay, HUD nudge 25%).
+- **Punch-zoom:** on heavy/special HIT (not block): 3-frame world-transform zoom to 1.03 anchored at the contact point, ease-out. Zoom state carries prev values for interpolation and freezes during pause.
+- **KO drama:** existing slow-mo + white flash, plus flat dark overlay 0.45 alpha over the world (flat fillRect, allowed), loser spotlighted normally, winner re-drawn with rim-light emphasis.
+- **Special afterimages:** during specials, sample the pose every 3 f into a 4-slot ring; redraw as accent-colored silhouette fills at alpha .25/.18/.12/.06. Only active during specials (adds ≤ 40 ops then).
+- **Dust:** landing puffs + on walk direction change (reuse `spawnDust`).
+
+### 18.4 HUD & typography
+
+- **Health bars:** skewed parallelograms (12° toward center), notch ticks every 10%, inner bevel line, dark plate; keep ghost-damage red, low-HP pulse, white hit-flash. Fill keeps the lime `#34C52A → #a8e63c` identity.
+- **Portrait chips:** ~34 px head-only renders (reuse the head routine) at the outer bar ends.
+- **Names:** in banner plates under the bars. **Round pips:** moved to the bars' inner ends, ≥ 34 px below, so pips and names can no longer collide (fixes the v1 layout bug).
+- **Timer:** dark diamond plate, kept pulse/red-at-10s behavior.
+- **Procedural logotype:** a glyph-path table (~28 chunky angular glyphs on a 100-unit grid: A–Z subset covering all display strings, digits 0–3, `!` `.` `?`), drawn with −8° italic shear, dark extrusion offset (4 px down-right), top bevel highlight, via `drawLogotype(text, x, y, size, palette)`. Used by: title "KAZAN DUEL" (+ slow animated shine sweep), announcer cards (ROUND N / FIGHT! / K.O.! / PERFECT! / TIME UP / YOU WIN / CPU WINS / DRAW GAME), select-screen headers, VS banner. System font remains for small functional text (menus, names, hints). Card timing/behavior per §9.4 unchanged.
+- **Color discipline:** global `THEME` table — UI primary gold `#ffd23e`, danger `#ff5040`, lime `#34C52A` reserved for title logo, HP fill, and win states; menu/HUD plates near-black `#12121a`. Every subsystem reads `THEME`, no ad-hoc hex in HUD code.
+
+### 18.5 Projectile & touch-control art
+
+- **Ember Wave:** layered fireball — white-hot core ellipse, orange mid, 2–3 sin-wobbled flame-tongue triangles trailing, slow rotation; denser ember trail.
+- **Veil Arrow:** sleek crescent bolt with a thin light streak; **Rising Veil:** the same crescent angled 45° with a short sparkle trail; **Fault Line:** jagged rock-wave — 3 tumbling dark chunks + dust puffs at the leading edge, hugging the floor.
+- All projectiles stay in the batched `'lighter'` block, tinted per character accent.
+- **Touch controls (restyle only — ids, geometry, hit areas, and visibility rules unchanged):** dark plates `rgba(12,12,16,0.55)`, 2 px borders — LP/LK gold, HP/HK ember, SP1/SP2 teal; pressed = brighter fill + existing scale behavior.
+
+### 18.6 New-entity interpolation contract (hard rule)
+
+Any new animated thing (afterimage sampler, punch-zoom, petals, steam wisps, cloth springs) must either live in the particle pool (inherits px/py) or carry prev-position fields snapped in `setPrev`, the pause snap, and the hitstop freeze — no interpolation buzz, no motion during pause (the v1 wall-clock headband bug class is banned).
+
+---
+
+## 19. Air-Hit Reset — Bug Fix (normative)
+
+**Bug (diagnosed & reproduced):** a non-knockdown hit (Jab, Air Jab, projectile…) connecting with an **airborne** defender put the defender into `hitstun` — a ground-only state with no gravity and no landing check — stranding them at mid-air y forever; they then walked/attacked/blocked while floating (`airborne()` returns false for those states). Repro script: `node test/repro-jumpattack.mjs` (Part A proves the pure jump-attack flow is fine; Part B reproduces via CPU anti-air trades). The same float can strand the CPU (soft-lock risk).
+
+**Fix (the minimal, state-machine-consistent one):** in `applyContact`'s clean-hit path, airborne defenders hit by **non-KD** moves route through the existing `kdAir` state (gravity + landing already proven), exactly like the KD branch:
+
+```
+} else if (def.airborne()) {          // air hit by a non-KD move → air reset
+  def.setState('kdAir'); def.move = null; def.rot = 0; def.crouching = false;
+  def.vy = -7; def.vx = 3.5 * pushDir;
+  if (def.y >= GROUND) def.y = GROUND - 1;   // same guard as the KD branch
+} else { /* existing grounded hitstun path unchanged */ }
+```
+
+This is standard fighting-game air-reset behavior. It applies to BOTH fighters (fixes the symmetric CPU float). **Deliberate gameplay consequence (accepted):** hits on airborne opponents no longer leave them in `hitstun`, so combo scaling can't chain off air hits — anti-airs now grant a soft knockdown instead of a juggle-ish stun, consistent with §6.2 "juggles: none".
+
+**Engine invariant (belt-and-braces, required):** at the end of `Fighter.update()`, if the fighter is in a grounded state (`idle/walkF/walkB/crouch/hitstun/blockstun/attack-grounded/getup/win`) with `y < GROUND`, snap into `kdAir` (which will land it). This must never fire in normal play — it is a self-healing assertion against future regressions.
+
+**Verification gates:** `node test/repro-jumpattack.mjs` exits 0 (Part A all-PASS, Part B cannot reproduce); `node test/run-tests.mjs` 42/42; `node test/probe-ai.mjs` passes (the fix changes anti-air reward economy, so the §11.8 ladder must be re-verified — if Medium drifts, tuning happens per §15.4 rules, never in §11.6/§11.8).
+
+---
+
+## 20. v2 Scope, Budget, Ordering
+
+- **Line budget v2:** ~5,500–6,500 lines for `index.html` (supersedes §13's 3,500 for v2). Perf budget (§12) unchanged and binding — the perf valve must not trip on target hardware.
+- **Still cut (unchanged):** throws, super meter, dizzy, air block, air specials, cross-ups, juggles, dashes, netplay, replays, motion inputs.
+- **Build order (one dev agent per milestone, sequential, each leaves the game fully green):**
+  1. Air-hit reset fix + character-registry/moveset-seam refactor (zero behavior change beyond the fix).
+  2. Roster of four: stats, new specials (+armor, new projectiles), per-char AI role maps, `__SF` extensions.
+  3. Three stages + registry + parallax.
+  4. Character-select flow (fighter / rival / battleground phases).
+  5. Graphics overhaul: fighter reskin, FX/juice, HUD + logotype, projectile art, touch restyle.
+  6. Test-suite extension (new checks: select flow, per-character differences, stage variety, air-reset regression) + full verification.
+- **Non-regression gates after EVERY milestone:** `node test/smoke.mjs`, `node test/run-tests.mjs` (as updated up to that milestone), `node test/probe-ai.mjs`, and from milestone 1 on `node test/repro-jumpattack.mjs` — all green, zero console errors, `__SF.start('medium')` works with no arguments.
+
+## 21. v2 Test Contract Summary
+
+The authoritative contract lives in TESTING.md. v2 extends it **backward-compatibly**: `__SF.state()` gains `stage`, `roster`, `stages`, `select`, and `p1.char`/`p2.char`; `__SF.start(difficulty, opts?)` accepts optional `{p1, p2, stage}` (invalid/missing → defaults kazan/volt/harbor). No existing field is renamed or removed; no touch DOM id changes; scene enum unchanged (`select` covers all three select phases). New harness checks: select-flow drive-through (keyboard + tap), per-character stat/special verification, stage variety + resize, and the jump-attack float regression (adapted from `test/repro-jumpattack.mjs`).

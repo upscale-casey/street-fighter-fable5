@@ -1,4 +1,4 @@
-// KAZAN DUEL automated test harness — implements TESTING.md §5 checks 1-10
+// KAZAN DUEL automated test harness — implements TESTING.md §5 checks 1-14
 // in BOTH Chromium and WebKit. No test framework; plain Node + Playwright.
 //
 //   node test/run-tests.mjs
@@ -15,6 +15,10 @@ const SHOTS_DIR = fileURLToPath(new URL('./screenshots/', import.meta.url));
 mkdirSync(SHOTS_DIR, { recursive: true });
 
 const MAXHP = 1000;
+const VOLT_MAXHP = 920; // §15.2 — default CPU (P2) is now volt, not a kazan-hp clone
+// §15.2 authoritative per-character table (DESIGN.md §15.2 / TESTING.md §1)
+const CHAR_MAXHP = { kazan: 1000, volt: 920, tetsu: 1150, sable: 950 };
+const CHAR_WALKF = { kazan: 3.2, volt: 3.8, tetsu: 2.6, sable: 3.1 }; // lpx/logic-frame, forward
 const results = []; // { engine, name, pass, detail }
 
 /* ---------------------------------------------------------------- utils */
@@ -60,13 +64,16 @@ async function sampleStates(page, durationMs, intervalMs = 80) {
   return out;
 }
 
-async function startFight(page, difficulty = 'medium', ai = false) {
+// (v2) opts?: { p1?, p2?, stage? } — forwarded to __SF.start's optional
+// second argument (TESTING.md §1). Omitted/undefined preserves the exact
+// v1 call shape and default matchup.
+async function startFight(page, difficulty = 'medium', ai = false, opts) {
   await page.evaluate(
-    ([d, a]) => {
+    ([d, a, o]) => {
       window.__SF.setAI(a);
-      window.__SF.start(d);
+      window.__SF.start(d, o);
     },
-    [difficulty, ai]
+    [difficulty, ai, opts]
   );
   const s = await waitState(
     page,
@@ -75,6 +82,82 @@ async function startFight(page, difficulty = 'medium', ai = false) {
     `scene 'fight' after __SF.start('${difficulty}')`
   );
   return s;
+}
+
+// (v2) read the live projectile list straight off G.fight (window.G is a
+// plain top-level `var`, already relied on implicitly by check 09's
+// canvas-pixel sampling approach) — __SF.state() intentionally doesn't
+// expose projectiles (TESTING.md §1/§21 don't ask for it), but a read-only
+// peek here is the only reliable way to observe "a projectile spawned"
+// distinct from "a fighter's own y rose" for the down-slot specials in
+// check 11.
+async function liveProjectiles(page) {
+  return page.evaluate(() => {
+    const F = window.G && window.G.fight;
+    if (!F || !F.projs) return [];
+    return F.projs.filter((p) => !p.dead).map((p) => ({ style: p.style, x: p.x, y: p.y }));
+  });
+}
+
+// (v2) map a world/"lpx" coordinate (the 1280x720 logical game space) to a
+// canvas backing-store pixel using the same ox/oy/scale/dpr the renderer
+// itself computes in relayout() — these are top-level `var`s and therefore
+// plain globals, exactly like the ones check 09 already reasons about.
+async function sampleWorldPixel(page, wx, wy) {
+  return page.evaluate(
+    ([wx, wy]) => {
+      const c = document.querySelector('canvas');
+      const px = Math.floor((window.ox + wx * window.scale) * window.dpr);
+      const py = Math.floor((window.oy + wy * window.scale) * window.dpr);
+      const d = c.getContext('2d').getImageData(px, py, 1, 1).data;
+      return [d[0], d[1], d[2]];
+    },
+    [wx, wy]
+  );
+}
+function colorDist(a, b) {
+  return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+}
+
+// Shared by check 09 and check 12 ("reuse check-09 helpers", TESTING.md §5.12):
+// resize the viewport, assert the canvas rescaled to fill it uniformly, and
+// (when the aspect ratio produces letterbox margins) sample a pixel deep
+// inside the margin and assert it's dark.
+async function resizeAndCheckLetterbox(page, w, h) {
+  await page.setViewportSize({ width: w, height: h });
+  await sleep(1000); // debounce is 150ms + extra relayout passes
+  const info = await page.evaluate(() => {
+    const c = document.querySelector('canvas');
+    return {
+      iw: window.innerWidth, ih: window.innerHeight,
+      styleW: c.style.width, styleH: c.style.height,
+      bw: c.width, bh: c.height,
+    };
+  });
+  if (info.styleW !== info.iw + 'px' || info.styleH !== info.ih + 'px')
+    throw new Error(
+      `canvas CSS size ${info.styleW}x${info.styleH} != viewport ${info.iw}x${info.ih} after resize to ${w}x${h}`
+    );
+  const rw = info.bw / info.iw, rh = info.bh / info.ih;
+  if (Math.abs(rw - rh) > 0.01)
+    throw new Error(`non-uniform backing-store scale: ${rw} vs ${rh}`);
+  const scale = Math.min(info.iw / 1280, info.ih / 720);
+  const gameW = 1280 * scale, gameH = 720 * scale;
+  let px = null;
+  if (info.ih - gameH > 40) px = { x: Math.floor(info.iw / 2), y: 8 };
+  else if (info.iw - gameW > 40) px = { x: 8, y: Math.floor(info.ih / 2) };
+  if (px) {
+    const rgb = await page.evaluate(
+      ([x, y, dpr]) => {
+        const c = document.querySelector('canvas');
+        const d = c.getContext('2d').getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
+        return [d[0], d[1], d[2]];
+      },
+      [px.x, px.y, info.bw / info.iw]
+    );
+    if (!(rgb[0] < 30 && rgb[1] < 30 && rgb[2] < 30))
+      throw new Error(`expected dark letterbox pixel at ${px.x},${px.y} for ${w}x${h}, got rgb(${rgb.join(',')})`);
+  }
 }
 
 // Hold ArrowRight until p1 is within `gap` lpx of p2 (frozen AI assumed).
@@ -227,15 +310,87 @@ const desktopTests = [
   },
 
   {
+    name: '10 select: keyboard-driven flow (tetsu/sable/market/hard) + Esc back-a-phase',
+    async run({ page, shot }) {
+      // Runs immediately after '01 load', so this is the page's first-ever
+      // visit to the select scene: G.sel is still its literal boot default
+      // (phase 0, cursor 0, p1 kazan, p2 random, stage harbor, diff medium).
+      await waitState(page, (s) => s.scene === 'title', 8000, "scene 'title' before select flow");
+      // key -> select (any mapped key transitions title -> select phase 0)
+      await page.keyboard.press('Enter');
+      let s = await waitState(
+        page,
+        (s) => s.scene === 'select' && s.select && s.select.phase === 0,
+        3000,
+        "scene 'select' phase 0 after a keypress from title"
+      );
+      if (s.select.cursor !== 0 || s.select.p1 !== 'kazan')
+        throw new Error(`unexpected fresh select state: ${JSON.stringify(s.select)}`);
+      await shot('select-phase0');
+      // phase 0: arrow cursor from kazan(0) -> tetsu(2). Each press must be
+      // allowed to land in its own logic tick (EDGE.right is a single-shot
+      // per-tick flag) before the next one fires, or two fast presses inside
+      // the same tick collapse into a single cursor step.
+      await page.keyboard.press('ArrowRight');
+      await waitState(page, (s) => s.select && s.select.cursor === 1, 2000, 'cursor at volt (index 1) in phase 0');
+      await page.keyboard.press('ArrowRight');
+      s = await waitState(page, (s) => s.select && s.select.cursor === 2, 2000, 'cursor at tetsu (index 2) in phase 0');
+      await page.keyboard.press('Enter'); // confirm
+      s = await waitState(page, (s) => s.select && s.select.phase === 1, 2000, 'phase 1 after confirming tetsu');
+      if (s.select.p1 !== 'tetsu') throw new Error(`select.p1 expected 'tetsu', got '${s.select.p1}'`);
+      await shot('select-phase1');
+      // Esc steps back a phase (1 -> 0), picks retained
+      await page.keyboard.press('Escape');
+      s = await waitState(page, (s) => s.select && s.select.phase === 0, 2000, 'Esc from phase 1 returns to phase 0');
+      if (s.select.p1 !== 'tetsu' || s.select.cursor !== 2)
+        throw new Error(`Esc-back-a-phase lost the phase-0 pick: ${JSON.stringify(s.select)}`);
+      // re-confirm tetsu to return to phase 1
+      await page.keyboard.press('Enter');
+      s = await waitState(page, (s) => s.select && s.select.phase === 1, 2000, 're-confirm tetsu -> phase 1 again');
+      // phase 1: default cursor on RANDOM (index 4, since p2 defaults 'random') -> arrow-left to sable(3)
+      if (s.select.cursor !== 4) throw new Error(`expected phase-1 cursor on RANDOM (4), got ${s.select.cursor}`);
+      await page.keyboard.press('ArrowLeft');
+      s = await waitState(page, (s) => s.select && s.select.cursor === 3, 2000, 'cursor at sable (index 3) in phase 1');
+      await page.keyboard.press('Enter');
+      s = await waitState(page, (s) => s.select && s.select.phase === 2, 2000, 'phase 2 after confirming sable');
+      if (s.select.p2 !== 'sable') throw new Error(`select.p2 expected 'sable', got '${s.select.p2}'`);
+      await shot('select-phase2');
+      // phase 2, row 0 (STAGE): harbor -> market (one ArrowRight)
+      if (s.select.stage !== 'harbor') throw new Error(`expected default stage 'harbor' entering phase 2, got '${s.select.stage}'`);
+      await page.keyboard.press('ArrowRight');
+      s = await waitState(page, (s) => s.select && s.select.stage === 'market', 2000, "stage cycled to 'market'");
+      // row 1 (DIFFICULTY): medium -> hard (down to the row, then one ArrowRight)
+      await page.keyboard.press('ArrowDown');
+      await waitState(page, (s) => s.select && s.select.cursor === 1, 2000, 'cursor on difficulty row');
+      await page.keyboard.press('ArrowRight');
+      await sleep(80); // difficulty isn't in state().select — settle before advancing off the row
+      // row 2 (FIGHT!): confirm
+      await page.keyboard.press('ArrowDown');
+      await waitState(page, (s) => s.select && s.select.cursor === 2, 2000, 'cursor on FIGHT! row');
+      await page.keyboard.press('Enter');
+      s = await waitState(page, (s) => s.scene === 'fight', 5000, 'FIGHT! confirm starts the match');
+      if (s.p1.char !== 'tetsu' || s.p2.char !== 'sable' || s.stage !== 'market')
+        throw new Error(
+          `select-driven fight mismatch: p1=${s.p1.char} p2=${s.p2.char} stage=${s.stage} (expected tetsu/sable/market)`
+        );
+      if (s.difficulty !== 'hard')
+        throw new Error(`select-driven difficulty expected 'hard', got '${s.difficulty}'`);
+      await shot('fight-matchup-tetsu-sable-market');
+    },
+  },
+
+  {
     name: "02 __SF.start('medium'): fight scene, full HP both",
     async run({ page, shot }) {
       const s = await startFight(page, 'medium', false);
       if (s.difficulty !== 'medium')
         throw new Error(`difficulty expected 'medium', got '${s.difficulty}'`);
-      if (s.p1.hp !== s.p1.maxHp || s.p1.hp !== MAXHP)
-        throw new Error(`p1 not at full HP: hp=${s.p1.hp} maxHp=${s.p1.maxHp}`);
-      if (s.p2.hp !== s.p2.maxHp || s.p2.hp !== MAXHP)
-        throw new Error(`p2 not at full HP: hp=${s.p2.hp} maxHp=${s.p2.maxHp}`);
+      // §15.2 roster: default matchup is kazan (1000 HP) vs volt (920 HP) —
+      // per-fighter maxHp, not a flat 1000 for both (TESTING.md §1).
+      if (s.p1.hp !== s.p1.maxHp || s.p1.maxHp !== MAXHP)
+        throw new Error(`p1 not at full HP: hp=${s.p1.hp} maxHp=${s.p1.maxHp} (expected ${MAXHP})`);
+      if (s.p2.hp !== s.p2.maxHp || s.p2.maxHp !== VOLT_MAXHP)
+        throw new Error(`p2 not at full HP: hp=${s.p2.hp} maxHp=${s.p2.maxHp} (expected ${VOLT_MAXHP})`);
       if (s.round !== 1) throw new Error(`round expected 1, got ${s.round}`);
       await shot('fight');
     },
@@ -320,8 +475,10 @@ const desktopTests = [
       await waitState(page, (s) => s.scene === 'fight' && s.round === 2, 12000, 'round 2 fight scene');
       await waitPlayPhase(page);
       const r2 = await sf(page);
-      if (r2.p1.hp !== MAXHP || r2.p2.hp !== MAXHP)
-        throw new Error(`round 2 did not reset HP: p1=${r2.p1.hp} p2=${r2.p2.hp}`);
+      // §15.2 roster: compare against each fighter's own maxHp, not a flat
+      // 1000 for both (TESTING.md §1 — default matchup is kazan 1000/volt 920).
+      if (r2.p1.hp !== r2.p1.maxHp || r2.p2.hp !== r2.p2.maxHp)
+        throw new Error(`round 2 did not reset HP: p1=${r2.p1.hp}/${r2.p1.maxHp} p2=${r2.p2.hp}/${r2.p2.maxHp}`);
       // ---- round 2 KO → match win
       await page.evaluate(() => window.__SF.setHP(2, 1));
       await walkToOpponent(page);
@@ -339,8 +496,8 @@ const desktopTests = [
         10000,
         'rematch: fresh fight (round 1, 0-0)'
       );
-      if (re.p1.hp !== MAXHP || re.p2.hp !== MAXHP)
-        throw new Error(`rematch did not reset HP: p1=${re.p1.hp} p2=${re.p2.hp}`);
+      if (re.p1.hp !== re.p1.maxHp || re.p2.hp !== re.p2.maxHp)
+        throw new Error(`rematch did not reset HP: p1=${re.p1.hp}/${re.p1.maxHp} p2=${re.p2.hp}/${re.p2.maxHp}`);
       await waitPlayPhase(page);
     },
   },
@@ -401,47 +558,213 @@ const desktopTests = [
         { w: 1400, h: 500 }, // wide: expect left/right letterbox
         { w: 1280, h: 720 },
       ];
-      for (const { w, h } of sizes) {
-        await page.setViewportSize({ width: w, height: h });
-        await sleep(1000); // debounce is 150ms + extra relayout passes
-        const info = await page.evaluate(() => {
-          const c = document.querySelector('canvas');
-          return {
-            iw: window.innerWidth, ih: window.innerHeight,
-            styleW: c.style.width, styleH: c.style.height,
-            bw: c.width, bh: c.height,
-          };
-        });
-        if (info.styleW !== info.iw + 'px' || info.styleH !== info.ih + 'px')
-          throw new Error(
-            `canvas CSS size ${info.styleW}x${info.styleH} != viewport ${info.iw}x${info.ih} after resize to ${w}x${h}`
-          );
-        const rw = info.bw / info.iw, rh = info.bh / info.ih;
-        if (Math.abs(rw - rh) > 0.01)
-          throw new Error(`non-uniform backing-store scale: ${rw} vs ${rh}`);
-        // letterbox check: sample a pixel deep inside the expected margin
-        const scale = Math.min(info.iw / 1280, info.ih / 720);
-        const gameW = 1280 * scale, gameH = 720 * scale;
-        let px = null;
-        if (info.ih - gameH > 40) px = { x: Math.floor(info.iw / 2), y: 8 };
-        else if (info.iw - gameW > 40) px = { x: 8, y: Math.floor(info.ih / 2) };
-        if (px) {
-          const rgb = await page.evaluate(([x, y, dpr]) => {
-            const c = document.querySelector('canvas');
-            const d = c.getContext('2d').getImageData(Math.floor(x * dpr), Math.floor(y * dpr), 1, 1).data;
-            return [d[0], d[1], d[2]];
-          }, [px.x, px.y, info.bw / info.iw]);
-          if (!(rgb[0] < 30 && rgb[1] < 30 && rgb[2] < 30))
-            throw new Error(
-              `expected dark letterbox pixel at ${px.x},${px.y} for ${w}x${h}, got rgb(${rgb.join(',')})`
-            );
-        }
-      }
+      for (const { w, h } of sizes) await resizeAndCheckLetterbox(page, w, h);
       // game still alive after resizes
       const t1 = (await sf(page)).timer;
       await waitState(page, (s) => s.timer < t1, 5000, 'timer still ticking after resizes');
       if (errors.length > errsBefore)
         throw new Error('errors during resize:\n  ' + errors.slice(errsBefore).join('\n  '));
+    },
+  },
+
+  {
+    name: '11 chars: per-character maxHp, walk speed, and down+SP special',
+    async run({ page }) {
+      const walkDist = {};
+      for (const c of ['kazan', 'volt', 'tetsu', 'sable']) {
+        const s0 = await startFight(page, 'medium', false, { p1: c, p2: 'kazan' });
+        if (s0.p1.char !== c) throw new Error(`${c}: p1.char expected '${c}', got '${s0.p1.char}'`);
+        if (s0.p1.maxHp !== CHAR_MAXHP[c])
+          throw new Error(`${c}: p1.maxHp expected ${CHAR_MAXHP[c]}, got ${s0.p1.maxHp}`);
+        if (s0.p1.hp !== s0.p1.maxHp)
+          throw new Error(`${c}: p1 not at full HP: ${s0.p1.hp}/${s0.p1.maxHp}`);
+
+        // -- walk speed: 600ms held forward (p1 spawns facing right) --
+        const x0 = s0.p1.x;
+        await page.keyboard.down('ArrowRight');
+        await sleep(600);
+        await page.keyboard.up('ArrowRight');
+        await sleep(100); // settle out of walk state
+        const s1 = await sf(page);
+        const dist = s1.p1.x - x0;
+        walkDist[c] = dist;
+        const expected = CHAR_WALKF[c] * 36; // 600ms @ 60fps = 36 logic ticks
+        if (dist < expected * 0.8 || dist > expected * 1.2)
+          throw new Error(
+            `${c}: 600ms forward-walk distance ${dist.toFixed(1)}lpx, expected ${expected.toFixed(1)}lpx ±20% (walkF=${CHAR_WALKF[c]})`
+          );
+
+        // -- Down+SP: character's unique down-slot special, distinguishing observable --
+        await page.keyboard.down('ArrowDown');
+        await page.keyboard.press('o'); // KeyO -> 'sp'; down held -> spSlots.d
+        await sleep(60);
+        await page.keyboard.up('ArrowDown');
+        if (c === 'kazan' || c === 'volt') {
+          // Sky Splitter / Thunder Spike: self-launch — p1 rises off the ground.
+          await waitState(
+            page,
+            (s) => s.p1.y < 600,
+            900,
+            `${c}: Down+SP (self-launch special) should raise p1.y above the ground`
+          );
+        } else {
+          // Fault Line / Rising Veil: a projectile spawns (ground-hugging / rising).
+          const wantStyle = c === 'tetsu' ? 'faultline' : 'risingveil';
+          let seen = null;
+          const t0 = Date.now();
+          while (Date.now() - t0 < 900 && !seen) {
+            const list = await liveProjectiles(page);
+            seen = list.find((p) => p.style === wantStyle) || null;
+            if (!seen) await sleep(30);
+          }
+          if (!seen)
+            throw new Error(`${c}: Down+SP did not spawn a live '${wantStyle}' projectile within 900ms`);
+        }
+        // let the move resolve before moving to the next character (best-effort)
+        await waitState(page, (s) => s.p1.y >= 615, 3000, `${c}: landed after Down+SP`).catch(() => {});
+      }
+      if (!(walkDist.volt > walkDist.kazan && walkDist.kazan > walkDist.tetsu))
+        throw new Error(
+          `walk-speed ordering violated (expected volt > kazan > tetsu): ` +
+            `volt=${walkDist.volt.toFixed(1)} kazan=${walkDist.kazan.toFixed(1)} tetsu=${walkDist.tetsu.toFixed(1)}`
+        );
+    },
+  },
+
+  {
+    name: '12 stages: three stages are visually distinct + resize-safe',
+    async run({ page, errors, shot }) {
+      const colors = {};
+      for (const st of ['harbor', 'market', 'temple']) {
+        const s = await startFight(page, 'medium', false, { stage: st });
+        if (s.stage !== st) throw new Error(`stage mismatch: expected '${st}', got '${s.stage}'`);
+        await sleep(150); // let a render pass bake/paint the new stage
+        colors[st] = await sampleWorldPixel(page, 200, 100); // sky, same world coord each stage
+        await shot(`fight-${st}`);
+      }
+      const pairs = [
+        ['harbor', 'market'],
+        ['harbor', 'temple'],
+        ['market', 'temple'],
+      ];
+      for (const [a, b] of pairs) {
+        if (colorDist(colors[a], colors[b]) < 40)
+          throw new Error(
+            `stages '${a}' and '${b}' sampled near-identical sky color at lpx(200,100): ` +
+              `${JSON.stringify(colors[a])} vs ${JSON.stringify(colors[b])}`
+          );
+      }
+      // resize mid-fight on the last-loaded stage — reuse check-09's helper
+      const errsBefore = errors.length;
+      await resizeAndCheckLetterbox(page, 800, 1000);
+      await resizeAndCheckLetterbox(page, 1280, 720);
+      if (errors.length > errsBefore)
+        throw new Error('errors during stage resize:\n  ' + errors.slice(errsBefore).join('\n  '));
+    },
+  },
+
+  {
+    name: '13 air-reset regression: no mid-air float under sustained CPU jump-ins (hard, 15s)',
+    async run({ page }) {
+      const GROUNDED_ACTS = ['idle', 'walkF', 'walkB', 'crouch', 'attack', 'blockstun'];
+      const report = await page.evaluate(
+        ({ budgetMs, groundedActs }) =>
+          new Promise((resolve) => {
+            const GROUND_Y = 615;
+            const K = (t, c) => window.dispatchEvent(new KeyboardEvent(t, { code: c, bubbles: true }));
+            const held = new Set();
+            const down = (c) => { if (!held.has(c)) { held.add(c); K('keydown', c); } };
+            const up = (c) => { if (held.has(c)) { held.delete(c); K('keyup', c); } };
+            const releaseAll = () => { for (const c of [...held]) up(c); };
+            const S = () => window.__SF.state();
+            // §6/§19: an air-normal (MOVES[id].air) legitimately keeps
+            // action==='attack' for the fighter's ENTIRE remaining hang time
+            // once thrown (stepAttack only routes air moves back to a
+            // grounded state via landGround() on touchdown — there is no
+            // "move finished, still airborne" transition for m.air moves).
+            // That's correct, pre-existing behavior (see Part A of
+            // repro-jumpattack.mjs), not the air-reset bug, so it must not
+            // count as a "grounded action while airborne" violation here.
+            // Self-launch reversals (Sky Splitter / Thunder Spike) are the
+            // same legitimate case from the other direction: mid-move they
+            // set `splitAir` and the engine's own `airborne()` getter treats
+            // that exactly like an air move (state==='attack' && (m.air ||
+            // this.splitAir)) even though MOVES.splitter/.thunderspike.air
+            // is false — mirror that condition here too.
+            const isAirAttack = (who) => {
+              const F = window.G && window.G.fight;
+              if (!F) return false;
+              const f = who === 'p1' ? F.p1 : F.p2;
+              if (f.state !== 'attack' || !f.move) return false;
+              const m = window.MOVES[f.move];
+              return !!(m && (m.air || f.splitAir));
+            };
+            window.__SF.start('hard');
+            window.__SF.setAI(true);
+            const t0 = Date.now();
+            let lastTop = 0;
+            let lastJumpAt = 0;
+            let atkQueued = false, atkAt = 0, atkBtn = 'KeyU';
+            const consec = { p1: 0, p2: 0 };
+            const airHitAt = { p1: null, p2: null };
+            let violation = null;
+            let cycles = 0;
+            const iv = setInterval(() => {
+              if (violation || Date.now() - t0 > budgetMs) { cleanup(); return; }
+              if (Date.now() - lastTop > 900) {
+                window.__SF.setHP(1, 999999); window.__SF.setHP(2, 999999); window.__SF.setTimer(99);
+                lastTop = Date.now();
+              }
+              const s = S();
+              if (s.scene !== 'fight' || s.paused) {
+                releaseAll(); window.__SF.start('hard'); window.__SF.setAI(true); return;
+              }
+              cycles++;
+              for (const who of ['p1', 'p2']) {
+                const f = s[who];
+                const grounded = groundedActs.indexOf(f.action) >= 0 && !isAirAttack(who);
+                if (grounded && f.y < GROUND_Y) {
+                  consec[who]++;
+                  if (consec[who] > 30) {
+                    violation = {
+                      who,
+                      why: `grounded action "${f.action}" while y=${f.y.toFixed(1)} < ${GROUND_Y} for ${consec[who]} consecutive samples`,
+                    };
+                  }
+                } else consec[who] = 0;
+                const midAir = (f.action === 'hitstun' || f.action === 'kdAir') && f.y < GROUND_Y;
+                if (midAir) {
+                  if (airHitAt[who] == null) airHitAt[who] = Date.now();
+                  else if (Date.now() - airHitAt[who] > 2000) {
+                    violation = {
+                      who,
+                      why: `mid-air hit ("${f.action}") never returned to y>=${GROUND_Y} within 2s (y=${f.y.toFixed(1)})`,
+                    };
+                  }
+                } else airHitAt[who] = null;
+              }
+              if (violation) { cleanup(); return; }
+              // scripted repeated jump-in attacks
+              if (Date.now() - lastJumpAt > 900) {
+                lastJumpAt = Date.now();
+                const toward = s.p1.x < s.p2.x ? 'ArrowRight' : 'ArrowLeft';
+                down(toward); down('ArrowUp');
+                atkQueued = true; atkAt = Date.now() + 120 + Math.random() * 300;
+                atkBtn = Math.random() < 0.5 ? 'KeyU' : 'KeyI';
+                setTimeout(() => up('ArrowUp'), 130);
+                setTimeout(() => up(toward), 500);
+              }
+              if (atkQueued && Date.now() >= atkAt) {
+                atkQueued = false;
+                K('keydown', atkBtn); setTimeout(() => K('keyup', atkBtn), 35);
+              }
+            }, 20);
+            function cleanup() { clearInterval(iv); releaseAll(); resolve({ violation, cycles }); }
+          }),
+        { budgetMs: 15000, groundedActs: GROUNDED_ACTS }
+      );
+      if (report.violation)
+        throw new Error(`air-reset regression: ${report.violation.who}: ${report.violation.why} (${report.cycles} sample cycles)`);
     },
   },
 ];
@@ -575,6 +898,40 @@ function touchTests(viewport, tag, full) {
           if (still.timer !== p.timer) throw new Error(`timer ran while paused: ${p.timer} -> ${still.timer}`);
           await tapElement(page, '#btn-pause');
           await waitState(page, (s) => s.paused === false, 3000, 'paused=false after second #btn-pause tap');
+        },
+      },
+      {
+        name: `10${tag} touch ${viewport.width}x${viewport.height}: canvas tap drives a select confirm`,
+        async run({ page, shot }) {
+          // Reload for a clean slate (prior touch tests left the game mid-fight)
+          // so this exercises the real title -> select canvas-tap path (§16).
+          await page.reload();
+          await sleep(1200);
+          await waitState(page, (s) => s.scene === 'title', 10000, 'title scene after reload (touch ctx)');
+          // canvas tap (anywhere) from title -> select phase 0 (menuTap sets EDGE.any)
+          await page.touchscreen.tap(viewport.width / 2, viewport.height / 2);
+          const s0 = await waitState(
+            page,
+            (s) => s.scene === 'select' && s.select && s.select.phase === 0,
+            3000,
+            'select phase 0 after a canvas tap from title'
+          );
+          await sleep(150); // let a render pass populate G.menuRects for phase 0
+          const rects = await page.evaluate(() => window.G.menuRects.slice());
+          const cursor = s0.select.cursor;
+          const r = rects.find((rr) => rr.idx === cursor);
+          if (!r) throw new Error(`no menuRect for cursor ${cursor}; rects=${JSON.stringify(rects)}`);
+          // tap the already-highlighted card -> two-tap-confirm pattern (§16): confirms immediately
+          await page.touchscreen.tap(r.x + r.w / 2, r.y + r.h / 2);
+          const s1 = await waitState(
+            page,
+            (s) => s.select && s.select.phase === 1,
+            3000,
+            'phase 1 after canvas-tap confirm of the phase-0 card'
+          );
+          if (s1.select.p1 !== s0.roster[cursor])
+            throw new Error(`canvas-tap confirm picked '${s1.select.p1}', expected '${s0.roster[cursor]}'`);
+          await shot(`touch-select-tap-${viewport.width}x${viewport.height}`);
         },
       }
     );
